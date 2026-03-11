@@ -283,7 +283,7 @@ bot.command("start", async (ctx) => {
 
   await ctx.reply(
     `👋 *Halo, ${esc(name)}\\!*\n\n` +
-    `Selamat datang di *MyDuit* 💰\n` +
+    `Selamat datang di *MyDuit Ku* 💰\n` +
     `Bot pribadimu untuk mencatat saldo & transaksi keuangan\\.\n\n` +
     `Pilih menu di bawah ini untuk memulai:`,
     { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
@@ -299,7 +299,7 @@ async function handleSaldo(ctx) {
   if (accounts.length === 0) return ctx.reply(`💳 Belum ada rekening tercatat\\.\n\nGunakan /tambahbank untuk menambahkan rekening pertamamu\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
 
   let total = 0;
-  let text = `💰 *Saldo Rekening MyDuit*\n─────────────────────\n`;
+  let text = `💰 *Saldo Rekening MyDuit Ku*\n─────────────────────\n`;
   for (const acc of accounts) {
     const icon = acc.balance >= 0 ? "🟢" : "🔴";
     text += `${icon} *${esc(acc.bank_name)}*\n    ${esc(formatRupiah(acc.balance))}\n\n`;
@@ -361,7 +361,7 @@ bot.command("setlimit", async (ctx) => {
 
 bot.command("settings", async (ctx) => {
   clearSession(ctx.chat.id);
-  await ctx.reply(`⚙️ *Pengaturan MyDuit*\n\nPilih opsi yang ingin diatur:`, { parse_mode: "MarkdownV2", reply_markup: pengaturanKeyboard });
+  await ctx.reply(`⚙️ *Pengaturan MyDuit Ku*\n\nPilih opsi yang ingin diatur:`, { parse_mode: "MarkdownV2", reply_markup: pengaturanKeyboard });
 });
 
 async function handlePrediksi(ctx) {
@@ -461,7 +461,7 @@ async function handlePrediksi(ctx) {
   else if (savingRate > 0.3) advice = "Hebat! Tabunganmu bulan ini di atas 30%. Pertahankan!";
   else if (smartDailyLimit > 0 && (todaySpend / smartDailyLimit) < 0.5 && score > 80) advice = "Pengeluaran terkendali. Keuanganmu sehat hari ini.";
 
-  let text = `🔮 *Prediksi Keuangan MyDuit*\n─────────────────\n`;
+  let text = `🔮 *Prediksi Keuangan MyDuit Ku*\n─────────────────\n`;
   text += `💰 Total saldo: *${esc(formatRupiah(totalBalance))}*\n`;
   text += `💸 Rata\\-rata harian: *${esc(formatRupiah(avg30))}*\n`;
   text += `📈 Tren: *${esc(trendStr)}* ${esc(trendEmoji)}\n\n`;
@@ -543,7 +543,7 @@ async function generateReport(ctx, isMonthly) {
   else if (savingRate > 0.1) msgAdvice = "Cukup baik, tapi kamu masih bisa lebih efisien!";
   else if (savingRate < 0) msgAdvice = "Pengeluaran membengkak dari pemasukan. Segera perbaiki keuanganmu!";
 
-  let text = `📊 *Laporan ${title} MyDuit*\n`;
+  let text = `📊 *Laporan ${title} MyDuit Ku*\n`;
   text += `Periode: ${esc(formatDate(periodStart.toISOString().split('T')[0]))} \\- ${esc(formatDate(periodEnd.toISOString().split('T')[0]))}\n─────────────────\n`;
   text += `💰 Pemasukan:    *${esc(formatRupiah(totalIn))}*\n`;
   text += `💸 Pengeluaran:  *${esc(formatRupiah(totalOut))}*\n`;
@@ -838,7 +838,7 @@ bot.on("message:text", async (ctx) => {
 
 // ── VERCEL HANDLER ────────────────────────────────────────────
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(200).json({ status: "MyDuit Bot is running 💰" });
+  if (req.method !== "POST") return res.status(200).json({ status: "MyDuit Ku Bot is running 💰" });
   try {
     await initDB();
     await bot.init();
