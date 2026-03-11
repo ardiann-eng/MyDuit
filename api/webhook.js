@@ -281,6 +281,12 @@ bot.command("start", async (ctx) => {
   await upsertUser(ctx.from.id, name);
   clearSession(ctx.chat.id);
 
+  // One-time removal of persistent keyboard for old users
+  await ctx.reply(".", {
+    reply_markup: { remove_keyboard: true }
+  }).then(msg => ctx.api.deleteMessage(ctx.chat.id, msg.message_id))
+    .catch(() => { });
+
   await ctx.reply(
     `👋 *Halo, ${esc(name)}\\!*\n\n` +
     `Selamat datang di *MyDuit Ku* 💰\n` +
@@ -288,15 +294,12 @@ bot.command("start", async (ctx) => {
     `Pilih menu di bawah ini untuk memulai:`,
     { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
   );
-
-  // Send a silent message to trigger the persistent keyboard
-  await ctx.reply("Gunakan menu di bawah untuk akses cepat 👇");
 });
 
 async function handleSaldo(ctx) {
   clearSession(ctx.chat.id);
   const accounts = await getAccounts(ctx.from.id);
-  if (accounts.length === 0) return ctx.reply(`💳 Belum ada rekening tercatat\\.\n\nGunakan /tambahbank untuk menambahkan rekening pertamamu\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
+  if (accounts.length === 0) return ctx.reply(`💳 Belum ada rekening tercatat\\.\n\nGunakan /tambahbank untuk menambahkan rekening pertamamu\\.`, { parse_mode: "MarkdownV2" });
 
   let total = 0;
   let text = `💰 *Saldo Rekening MyDuit Ku*\n─────────────────────\n`;
@@ -312,7 +315,7 @@ async function handleSaldo(ctx) {
 async function handleRiwayat(ctx) {
   clearSession(ctx.chat.id);
   const txs = await getRecentTransactions(ctx.from.id, 10);
-  if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
+  if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2" });
 
   let text = `📋 *10 Transaksi Terakhir*\n─────────────────────\n`;
   for (const tx of txs) {
@@ -478,7 +481,7 @@ async function handlePrediksi(ctx) {
   text += `\n🎯 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n`;
   text += `💡 _${esc(advice)}_`;
 
-  await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
+  await ctx.reply(text, { parse_mode: "MarkdownV2" });
 }
 
 async function generateReport(ctx, isMonthly) {
@@ -564,7 +567,7 @@ async function generateReport(ctx, isMonthly) {
   text += `🎯 Skor Rata\\-rata: *${esc(score.toString())}/100*\n`;
   text += `💡 _${esc(msgAdvice)}_`;
 
-  await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
+  await ctx.reply(text, { parse_mode: "MarkdownV2" });
 }
 
 // ── COMMAND BINDINGS ──────────────────────────────────────────
