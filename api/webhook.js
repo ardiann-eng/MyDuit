@@ -350,17 +350,19 @@ async function handleTambahBank(ctx) {
   await ctx.reply(`🏦 *Tambah Rekening Baru*\n\nKetik nama bank atau dompet digitalmu\\.\n_Contoh: BCA, Mandiri, GoPay, Dana_`, { parse_mode: "MarkdownV2" });
 }
 
-bot.command("tambahkategori", async (ctx) => {
+async function handleTambahKategori(ctx) {
   clearSession(ctx.chat.id);
   getSession(ctx.chat.id).step = "tambahkategori_nama";
   await ctx.reply(`🏷 *Tambah Kategori Baru*\n\nKetik nama kategori pengeluaran kustom Anda beserta emojinya \\(opsional\\)\\.\n_Contoh: 🐶 Peliharaan_`, { parse_mode: "MarkdownV2" });
-});
+}
+bot.command("tambahkategori", handleTambahKategori);
 
-bot.command("setlimit", async (ctx) => {
+async function handleSetLimit(ctx) {
   clearSession(ctx.chat.id);
   getSession(ctx.chat.id).step = "setlimit_nominal";
   await ctx.reply(`⚠️ *Atur Batas Harian*\n\nKetik nominal batas pengeluaran harian Anda:\n_Contoh: 150000 / 150rb_\n\nKetik 0 untuk mematikan peringatan batas harian kustom\\.`, { parse_mode: "MarkdownV2" });
-});
+}
+bot.command("setlimit", handleSetLimit);
 
 bot.command("settings", async (ctx) => {
   clearSession(ctx.chat.id);
@@ -587,6 +589,10 @@ bot.command("laporanminggu", (ctx) => generateReport(ctx, false));
 bot.command("laporanbulan", (ctx) => generateReport(ctx, true));
 bot.hears("📊 Laporan", (ctx) => generateReport(ctx, true));
 
+bot.hears("➕ Tambah Kategori", handleTambahKategori);
+
+bot.hears("🎯 Set Limit", handleSetLimit);
+
 bot.command("tambahbank", handleTambahBank);
 bot.hears("🏦 Tambah Bank", handleTambahBank);
 
@@ -644,15 +650,21 @@ bot.on("callback_query:data", async (ctx) => {
     return;
   }
 
-  if (data === "menu_saldo") return bot.api.sendMessage(chatId, "/saldo");
-  if (data === "menu_catat") return bot.api.sendMessage(chatId, "/catat");
-  if (data === "menu_riwayat") return bot.api.sendMessage(chatId, "/riwayat");
-  if (data === "menu_prediksi") return bot.api.sendMessage(chatId, "/prediksi");
-  if (data === "menu_tambahbank") return bot.api.sendMessage(chatId, "/tambahbank");
-  if (data === "menu_laporan") return bot.api.sendMessage(chatId, "/laporanbulan");
-  if (data === "menu_hapusbank") return bot.api.sendMessage(chatId, "/hapusbank");
-  if (data === "menu_tambahkategori") return bot.api.sendMessage(chatId, "/tambahkategori");
-  if (data === "menu_setlimit") return bot.api.sendMessage(chatId, "/setlimit");
+  if (data.startsWith("menu_")) {
+    await ctx.answerCallbackQuery();
+    try { await ctx.deleteMessage(); } catch (e) { }
+
+    if (data === "menu_saldo") return handleSaldo(ctx);
+    if (data === "menu_catat") return handleCatat(ctx);
+    if (data === "menu_riwayat") return handleRiwayat(ctx);
+    if (data === "menu_prediksi") return handlePrediksi(ctx);
+    if (data === "menu_tambahbank") return handleTambahBank(ctx);
+    if (data === "menu_laporan") return generateReport(ctx, true);
+    if (data === "menu_hapusbank") return handleHapusBank(ctx);
+    if (data === "menu_tambahkategori") return handleTambahKategori(ctx);
+    if (data === "menu_setlimit") return handleSetLimit(ctx);
+    return;
+  }
 
   if (data.startsWith("hapus_")) {
     const accId = parseInt(data.replace("hapus_", ""));
