@@ -10,7 +10,7 @@ import {
   getCategorySuggestions, upsertCategorySuggestion, updateSmartLimit,
   updateLimitRecalcTime, getAlertLogWithCooldown, getTransactionsByDayGrouped,
   getSessionData, setSessionData, clearSessionData,
-  updateAccountBalance, updateAccountName
+  updateAccountBalance, updateAccountName, addCorrectionRecord
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 
@@ -484,6 +484,7 @@ async function handlePrediksi(ctx) {
 
   const accounts = await getAccounts(ctx.from.id);
   const totalBalance = accounts.reduce((sum, acc) => sum + acc.balance, 0);
+  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
 
   // Exact Days to empty using Smart Limit (adjusted)
   const daysUntilEmpty = smartDailyLimit > 0 ? Math.floor(totalBalance / smartDailyLimit) : 999;
@@ -713,7 +714,21 @@ bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
   const chatId = ctx.chat.id;
   const sess = await getSession(chatId);
-  await ctx.answerCallbackQuery();
+
+  // Determine if this is a heavy operation that needs loading feedback
+  const isHeavy = 
+    data === "catat_simpan" ||
+    data === "editrek_simpan_saldo" ||
+    data === "editrek_simpan_nama" ||
+    data.startsWith("konfirmhapus_") ||
+    data.startsWith("catat_akun_") ||
+    data.startsWith("editrek_akun_");
+
+  if (isHeavy) {
+    await ctx.answerCallbackQuery("⏳ Memproses...");
+  } else {
+    await ctx.answerCallbackQuery();
+  }
 
   if (data === "batal" || data === "menu_tutup") {
     await clearSession(chatId);
@@ -744,6 +759,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (data === "menu_hapusbank") return handleHapusBank(ctx);
     if (data === "menu_tambahkategori") return handleTambahKategori(ctx);
     if (data === "menu_setlimit") return handleSetLimit(ctx);
+    if (data === "menu_editrekening") return handleEditRekening(ctx);
     return;
   }
 
