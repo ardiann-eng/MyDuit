@@ -51,28 +51,28 @@ Dibangun dengan **Vercel** (serverless) + **Turso** (SQLite cloud) — 100% grat
    TELEGRAM_BOT_TOKEN  = (token dari BotFather)
    TURSO_DATABASE_URL  = (url dari Turso)
    TURSO_AUTH_TOKEN    = (token dari Turso)
+   WEBHOOK_SECRET      = (string rahasia panjang untuk validasi webhook)
+   CRON_SECRET         = (string rahasia untuk validasi cron jobs)
+   ALLOWED_USER_ID     = (opsional: comma-separated user IDs untuk private mode)
    ```
 5. Klik **Deploy**
 6. Setelah deploy, salin URL project → contoh: `https://myduit-bot.vercel.app`
 
 ---
 
-### Langkah 4 — Daftarkan Webhook ke Telegram
-Buka browser atau gunakan curl, akses URL berikut (ganti `TOKEN` dan `URL`):
+### Langkah 4 — Daftarkan Webhook ke Telegram (DENGAN SECURITY)
+Buka browser atau gunakan curl, akses URL berikut (ganti `TOKEN`, `URL`, dan `WEBHOOK_SECRET`):
 
 ```
-https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<URL_VERCEL>/api/webhook
+https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<URL_VERCEL>/api/webhook&secret_token=<WEBHOOK_SECRET>
 ```
 
 Contoh:
 ```
-https://api.telegram.org/bot123456:ABC-xyz/setWebhook?url=https://myduit-bot.vercel.app/api/webhook
+https://api.telegram.org/bot123456:ABC-xyz/setWebhook?url=https://myduit-bot.vercel.app/api/webhook&secret_token=my-super-secret-key-12345
 ```
 
-Kalau berhasil, Telegram akan membalas:
-```json
-{"ok": true, "description": "Webhook was set"}
-```
+**PENTING:** Gunakan `secret_token` parameter untuk keamanan. Token harus sama dengan `WEBHOOK_SECRET` di environment variables.
 
 ---
 
@@ -90,6 +90,7 @@ https://api.telegram.org/bot<TOKEN>/getWebhookInfo
 |---|---|
 | `/start` | Mulai bot & lihat menu |
 | `/tambahbank` | Tambah rekening baru + saldo awal |
+| `/editrekening` | ✏️ Edit nama atau saldo rekening |
 | `/saldo` | Lihat saldo semua rekening |
 | `/catat` | Catat pemasukan atau pengeluaran |
 | `/riwayat` | Lihat 10 transaksi terakhir |
@@ -101,6 +102,19 @@ https://api.telegram.org/bot<TOKEN>/getWebhookInfo
 - `1jt` → Rp1.000.000
 - `1.5jt` → Rp1.500.000
 
+### 📝 Fitur Edit Rekening
+Perbaiki kesalahan input saldo atau ubah nama rekening:
+- **Koreksi Saldo**: Ubah saldo dengan pencatatan otomatis sebagai transaksi koreksi
+- **Ganti Nama**: Ubah nama bank/dompet digital
+
+### 🔔 Notifikasi Otomatis (Vercel Cron)
+MyDuit mengirim notifikasi proaktif kepada pengguna:
+- **Pengingat Harian** (21:00 WIB): Jika belum ada catatan transaksi hari ini
+- **Laporan Bulanan** (08:00 WIB, tanggal 1): Ringkasan pemasukan, pengeluaran, dan surplus/defisit bulan lalu
+- **Peringatan Saldo Rendah**: Jika saldo rekening di bawah 10% saldo awal (1x per 12 jam)
+
+Vercel Cron Jobs berjalan otomatis di background — tidak perlu konfigurasi tambahan selain mengisi `CRON_SECRET` di environment variables.
+
 ---
 
 ## 🗂 Struktur Project
@@ -108,13 +122,14 @@ https://api.telegram.org/bot<TOKEN>/getWebhookInfo
 ```
 myduit/
 ├── api/
-│   └── webhook.js      ← Vercel serverless function (otak bot)
+│   ├── webhook.js      ← Vercel serverless function (otak bot)
+│   └── cron.js         ← Cron jobs untuk notifikasi otomatis
 ├── lib/
 │   ├── db.js           ← Koneksi & query Turso database
 │   └── format.js       ← Helper format Rupiah & tanggal
 ├── .env.example        ← Template environment variables
 ├── package.json
-├── vercel.json
+├── vercel.json         ← Konfigurasi Vercel (termasuk cron schedule)
 └── README.md
 ```
 

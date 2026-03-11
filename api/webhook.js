@@ -201,80 +201,28 @@ async function calculateScore(telegramId, dailyLimit) {
 // ── ML SMART LIMIT ─────────────────────────────────────────────
 async function calculateSmartLimit(telegramId) {
   const settings = await getUserSettings(telegramId);
-  const now = new Date();
 
-  // Recalculate only if > 7 days since last recalc AND not custom
-  if (settings.limit_mode === 'custom') return settings.daily_limit;
-
-  if (settings.last_recalc) {
-    const lastDate = new Date(settings.last_recalc + "Z");
-    const diffDays = Math.floor((now - lastDate) / (1000 * 60 * 60 * 24));
-    // If not first time and hasn't been 7 days, skip
-    if (settings.daily_limit > 0 && diffDays < 7) {
-      return settings.daily_limit;
-    }
+  // Respect custom limit
+  if (settings.limit_mode === 'custom' && settings.daily_limit > 0) {
+    return settings.daily_limit;
   }
 
-  const grouped = await getTransactionsByDayGrouped(telegramId, 30);
+  // Auto mode: always recalculate from current balance
+  const accounts = await getAccounts(telegramId);
+  const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
 
-  let smartLimit = 0;
+  let dailyLimit = totalBalance * 0.20;
 
-  if (grouped.length < 7) {
-    // Bootstrap mode
-    const accounts = await getAccounts(telegramId);
-    const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
-    smartLimit = totalBalance * 0.20;
-  } else {
-    // ML mode
-    const values = grouped.map(g => g.daily_total);
-    const n = values.length;
-    const sum = values.reduce((a, b) => a + b, 0);
-    const mean = sum / n;
-
-    // Variance & Volatility (StdDev)
-    const variance = values.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / n;
-    const volatility = Math.sqrt(variance);
-
-    let coeff = 0.95;
-    // Need at least 21 days for 3 blocks of 7 days etc.
-    // The instructions say 3 blocks of 10 days each -> needs 30 days total ideally
-    // We will do our best with what we have
-    if (grouped.length >= 21) {
-      // Oldest to newest (grouped is ascending order)
-      const b1 = values.slice(0, Math.floor(n / 3));
-      const b2 = values.slice(Math.floor(n / 3), Math.floor(2 * n / 3));
-      const b3 = values.slice(Math.floor(2 * n / 3));
-
-      const avg1 = b1.reduce((a, b) => a + b, 0) / (b1.length || 1);
-      const avg2 = b2.reduce((a, b) => a + b, 0) / (b2.length || 1);
-      const avg3 = b3.reduce((a, b) => a + b, 0) / (b3.length || 1);
-
-      if (avg3 > avg2 && avg2 > avg1) coeff = 0.85; // Rising -> tighten
-      else if (avg3 < avg2 && avg2 < avg1) coeff = 1.05; // Falling -> loosen
-    }
-
-    let safetyMargin = 1 - (mean > 0 ? (volatility / mean * 0.3) : 0);
-    safetyMargin = Math.max(0.7, Math.min(1.0, safetyMargin)); // Clamp 0.7 - 1.0
-
-    smartLimit = mean * coeff * safetyMargin;
-  }
-
-  // ── MINIMUM FLOOR ──
-  // Floor: minimum Rp 50.000/day
-  const MINIMUM_DAILY_LIMIT = 50000;
-  if (smartLimit < MINIMUM_DAILY_LIMIT) {
-    smartLimit = MINIMUM_DAILY_LIMIT;
-  }
-
-  // Income ratio guard
   if (settings.monthly_income > 0) {
-    const maxMonthlySpend = settings.monthly_income * 0.70;
-    const incomeBasedLimit = maxMonthlySpend / 30;
-    if (smartLimit > incomeBasedLimit) smartLimit = incomeBasedLimit;
+    const incomeBasedLimit = (settings.monthly_income * 0.70) / 30;
+    dailyLimit = Math.min(dailyLimit, incomeBasedLimit);
   }
 
-  await updateSmartLimit(telegramId, smartLimit);
-  return smartLimit;
+  if (dailyLimit < 10000) dailyLimit = 10000;
+  dailyLimit = Math.round(dailyLimit / 100) * 100;
+
+  await updateSmartLimit(telegramId, dailyLimit);
+  return dailyLimit;
 }
 
 // ── SMART ALERT SYSTEM ─────────────────────────────────────────
