@@ -8,7 +8,9 @@ import {
   getAlertLog, logAlert, getTransactionsByDateRange,
   getTransactionsForCurrentMonth, getTransactionsForCurrentWeek,
   getCategorySuggestions, upsertCategorySuggestion, updateSmartLimit,
-  updateLimitRecalcTime, getAlertLogWithCooldown, getTransactionsByDayGrouped
+  updateLimitRecalcTime, getAlertLogWithCooldown, getTransactionsByDayGrouped,
+  getSessionData, setSessionData, clearSessionData,
+  updateAccountBalance, updateAccountName
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 
@@ -57,9 +59,6 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// Session in-memory
-const sessions = new Map();
-
 // ── SECURITY: RATE LIMITING ────────────────────────────────────
 // Max 1 message per second per user
 const rateLimitMap = new Map();
@@ -82,13 +81,17 @@ async function ensureDB() {
   }
 }
 
-function getSession(chatId) {
-  if (!sessions.has(chatId)) sessions.set(chatId, {});
-  return sessions.get(chatId);
+// ── SESSION MANAGEMENT (Turso-backed) ──────────────────────────
+async function getSession(chatId) {
+  return await getSessionData(chatId);
 }
 
-function clearSession(chatId) {
-  sessions.set(chatId, {});
+async function saveSession(chatId, sess) {
+  await setSessionData(chatId, sess);
+}
+
+async function clearSession(chatId) {
+  await clearSessionData(chatId);
 }
 
 // ── CONSTANTS ─────────────────────────────────────────────────
@@ -109,7 +112,8 @@ const startKeyboard = new InlineKeyboard()
   .text("📝 Catat Transaksi", "menu_catat").row()
   .text("📋 Riwayat", "menu_riwayat")
   .text("🔮 Prediksi", "menu_prediksi").row()
-  .text("🏦 Tambah Rekening", "menu_tambahbank").row()
+  .text("🏦 Tambah Rekening", "menu_tambahbank")
+  .text("✏️ Edit Rekening", "menu_editrekening").row()
   .text("📊 Laporan Bulan Ini", "menu_laporan");
 
 const pengaturanKeyboard = new InlineKeyboard()
@@ -219,7 +223,7 @@ async function calculateSmartLimit(telegramId) {
     // Bootstrap mode
     const accounts = await getAccounts(telegramId);
     const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
-    smartLimit = (totalBalance * 0.20) / 30;
+    smartLimit = totalBalance * 0.20;
   } else {
     // ML mode
     const values = grouped.map(g => g.daily_total);
@@ -255,6 +259,13 @@ async function calculateSmartLimit(telegramId) {
     smartLimit = mean * coeff * safetyMargin;
   }
 
+  // ── MINIMUM FLOOR ──
+  // Floor: minimum Rp 50.000/day
+  const MINIMUM_DAILY_LIMIT = 50000;
+  if (smartLimit < MINIMUM_DAILY_LIMIT) {
+    smartLimit = MINIMUM_DAILY_LIMIT;
+  }
+
   // Income ratio guard
   if (settings.monthly_income > 0) {
     const maxMonthlySpend = settings.monthly_income * 0.70;
@@ -285,7 +296,9 @@ async function analyzeAndAlert(ctx, telegramId) {
     const lastWeek = await getWeeklySpend(telegramId, 1);
 
     // ── PROGRESS BAR ──
-    const rawBarRatio = dailyLimit > 0 ? todaySpend / dailyLimit : 0;
+    const rawBarRatio = dailyLimit > 0 
+      ? Math.min(1, todaySpend / Math.round(dailyLimit)) 
+      : 0;
     const filled = Math.min(10, Math.round(rawBarRatio * 10));
     const barStr = '█'.repeat(filled) + '░'.repeat(10 - filled);
     const pctStr = dailyLimit > 0 ? Math.min(999, Math.round(rawBarRatio * 100)) : 0;
@@ -333,10 +346,17 @@ async function analyzeAndAlert(ctx, telegramId) {
     }
 
     // ── MESSAGE CONSTRUCTION ──
-    const remainingToSpend = Math.max(0, dailyLimit - todaySpend);
+    const limitDisplay = dailyLimit > 0 
+      ? formatRupiah(Math.round(dailyLimit)) 
+      : "Belum diatur";
+    const remainingToSpend = dailyLimit > 0 
+      ? Math.max(0, Math.round(dailyLimit) - todaySpend) 
+      : 0;
+
     let msg = `📊 *Analisis Transaksi*\n─────────────────\n`;
     msg += `🏦 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n\n`;
-    msg += `💸 Pengeluaran hari ini: *${esc(formatRupiah(todaySpend))}* / ${esc(formatRupiah(dailyLimit))}\n`;
+    msg += `💸 Pengeluaran hari ini: *${esc(formatRupiah(todaySpend))}*\n`;
+    msg += `🎯 Limit harian: ${esc(limitDisplay)}\n`;
     msg += `\\[${esc(barStr)} ${esc(pctStr.toString())}%\\]\n\n`;
     msg += `📅 Sisa hari ini: *${esc(formatRupiah(remainingToSpend))}*\n\n`;
 
@@ -422,21 +442,53 @@ async function handleHapusBank(ctx) {
 }
 
 async function handleTambahBank(ctx) {
-  clearSession(ctx.chat.id);
-  getSession(ctx.chat.id).step = "tambahbank_nama";
+  await clearSession(ctx.chat.id);
+  const sess = await getSession(ctx.chat.id);
+  sess.step = "tambahbank_nama";
+  await saveSession(ctx.chat.id, sess);
   await ctx.reply(`🏦 *Tambah Rekening Baru*\n\nKetik nama bank atau dompet digitalmu\\.\n_Contoh: BCA, Mandiri, GoPay, Dana_`, { parse_mode: "MarkdownV2" });
 }
 
+async function handleEditRekening(ctx) {
+  try {
+    await clearSession(ctx.chat.id);
+    const sess = await getSession(ctx.chat.id);
+    const accounts = await getAccounts(ctx.from.id);
+    
+    if (accounts.length === 0) {
+      return ctx.reply(`⚠️ Belum ada rekening\\. Gunakan /tambahbank untuk menambah rekening\\.`, { parse_mode: "MarkdownV2" });
+    }
+    
+    sess.step = "editrek_pilih_akun";
+    await saveSession(ctx.chat.id, sess);
+    
+    const kb = new InlineKeyboard();
+    for (const acc of accounts) {
+      kb.text(`🏦 ${esc(acc.bank_name)} — ${esc(formatRupiah(acc.balance))}`, `editrek_akun_${acc.id}`).row();
+    }
+    kb.text("❌ Batal", "batal");
+    
+    await ctx.reply(`✏️ *Edit Rekening*\n\nPilih rekening yang ingin diubah:`, { parse_mode: "MarkdownV2", reply_markup: kb });
+  } catch (err) {
+    console.error("handleEditRekening error:", err);
+    await ctx.reply(`⚠️ Terjadi kesalahan\\.`, { parse_mode: "MarkdownV2" });
+  }
+}
+
 async function handleTambahKategori(ctx) {
-  clearSession(ctx.chat.id);
-  getSession(ctx.chat.id).step = "tambahkategori_nama";
+  await clearSession(ctx.chat.id);
+  const sess = await getSession(ctx.chat.id);
+  sess.step = "tambahkategori_nama";
+  await saveSession(ctx.chat.id, sess);
   await ctx.reply(`🏷 *Tambah Kategori Baru*\n\nKetik nama kategori pengeluaran kustom Anda beserta emojinya \\(opsional\\)\\.\n_Contoh: 🐶 Peliharaan_`, { parse_mode: "MarkdownV2" });
 }
 bot.command("tambahkategori", handleTambahKategori);
 
 async function handleSetLimit(ctx) {
-  clearSession(ctx.chat.id);
-  getSession(ctx.chat.id).step = "setlimit_nominal";
+  await clearSession(ctx.chat.id);
+  const sess = await getSession(ctx.chat.id);
+  sess.step = "setlimit_nominal";
+  await saveSession(ctx.chat.id, sess);
   await ctx.reply(`⚠️ *Atur Batas Harian*\n\nKetik nominal batas pengeluaran harian Anda:\n_Contoh: 150000 / 150rb_\n\nKetik 0 untuk mematikan peringatan batas harian kustom\\.`, { parse_mode: "MarkdownV2" });
 }
 bot.command("setlimit", handleSetLimit);
@@ -634,12 +686,15 @@ bot.hears("🎯 Set Limit", handleSetLimit);
 bot.command("tambahbank", handleTambahBank);
 bot.hears("🏦 Tambah Bank", handleTambahBank);
 
+bot.command("editrekening", handleEditRekening);
+bot.hears("✏️ Edit Rekening", handleEditRekening);
+
 bot.command("hapusbank", handleHapusBank);
 bot.hears("🗑 Hapus Bank", handleHapusBank);
 
 // ── CATAT ──────────────────────────────────────────────────
 async function handleCatat(ctx) {
-  clearSession(ctx.chat.id); // Prevents session conflict
+  await clearSession(ctx.chat.id); // Prevents session conflict
   const accounts = await getAccounts(ctx.from.id);
   if (accounts.length === 0) return ctx.reply(`⚠️ Belum ada rekening\\. Tambah dulu dengan /tambahbank`, { parse_mode: "MarkdownV2" });
 
@@ -647,27 +702,56 @@ async function handleCatat(ctx) {
   for (const acc of accounts) keyboard.text(`🏦 ${acc.bank_name} (${formatRupiah(acc.balance)})`, `catat_akun_${acc.id}`).row();
   keyboard.text("❌ Batal", "batal");
 
-  getSession(ctx.chat.id).step = "catat_pilih_akun";
+  const sess = await getSession(ctx.chat.id);
+  sess.step = "catat_pilih_akun";
+  await saveSession(ctx.chat.id, sess);
   await ctx.reply(`📝 *Catat Transaksi*\n\nPilih rekening:`, { parse_mode: "MarkdownV2", reply_markup: keyboard });
 }
 
 // ── CATAT HELPERS ─────────────────────────────────────────────
 async function sendCatatPreview(ctx, sess) {
+  // Guard: if session is empty/corrupt, restart flow
+  if (!sess.accountId || !sess.accountName || !sess.type) {
+    await clearSession(ctx.chat.id);
+    return ctx.reply(
+      "⚠️ Sesi habis\\. Silakan mulai /catat ulang\\.",
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+  
   sess.step = "catat_konfirmasi";
-  const labelKategori = sess.type === "masuk" ? sess.source : sess.category;
-  const noteCat = sess.note ? sess.note : "\\-";
+  await saveSession(ctx.chat.id, sess);
+  
+  const labelKategori = sess.type === "masuk" 
+    ? (sess.source || "Lainnya") 
+    : (sess.category || "Lainnya");
+  const noteCat = sess.note ? esc(sess.note) : "\\-";
   const icon = sess.type === "masuk" ? "⬆️ Pemasukan" : "⬇️ Pengeluaran";
-  const text = `🔍 *Konfirmasi Transaksi*\n──────────────────\n🏦 Rekening : *${esc(sess.accountName)}*\n📂 Jenis    : *${esc(icon)}*\n🏷 Kategori : *${esc(labelKategori)}*\n💵 Nominal  : *${esc(formatRupiah(sess.amount))}*\n📝 Keterangan: *${esc(noteCat)}*\n──────────────────\nPastikan data sudah benar sebelum menyimpan\\.`;
+  
+  const text = 
+    `🔍 *Konfirmasi Transaksi*\n` +
+    `──────────────────\n` +
+    `🏦 Rekening : *${esc(sess.accountName)}*\n` +
+    `📂 Jenis    : *${esc(icon)}*\n` +
+    `🏷 Kategori : *${esc(labelKategori)}*\n` +
+    `💵 Nominal  : *${esc(formatRupiah(sess.amount))}*\n` +
+    `📝 Keterangan: ${noteCat}\n` +
+    `──────────────────\n` +
+    `Pastikan data sudah benar sebelum menyimpan\\.`;
+  
   const kb = new InlineKeyboard()
     .text("✅ Simpan", "catat_simpan")
     .text("✏️ Ubah Nominal", "catat_ubah_nominal").row()
     .text("❌ Batal", "batal");
 
   if (ctx.callbackQuery) {
-    return ctx.editMessageText(text, { parse_mode: "MarkdownV2", reply_markup: kb });
-  } else {
-    return ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
+    return ctx.editMessageText(text, { 
+      parse_mode: "MarkdownV2", reply_markup: kb 
+    });
   }
+  return ctx.reply(text, { 
+    parse_mode: "MarkdownV2", reply_markup: kb 
+  });
 }
 
 // ── CALLBACK QUERY HANDLER ────────────────────────────────────
@@ -680,11 +764,11 @@ bot.on("callback_query:data", async (ctx) => {
 
   const data = ctx.callbackQuery.data;
   const chatId = ctx.chat.id;
-  const sess = getSession(chatId);
+  const sess = await getSession(chatId);
   await ctx.answerCallbackQuery();
 
   if (data === "batal" || data === "menu_tutup") {
-    clearSession(chatId);
+    await clearSession(chatId);
     if (data === "menu_tutup") {
       await ctx.deleteMessage().catch(() => { });
     } else {
@@ -740,6 +824,7 @@ bot.on("callback_query:data", async (ctx) => {
     sess.step = "catat_pilih_tipe";
     sess.accountId = accId;
     sess.accountName = acc.bank_name;
+    await saveSession(chatId, sess);
     const kb = new InlineKeyboard()
       .text("⬆️ Pemasukan", "catat_tipe_masuk")
       .text("⬇️ Pengeluaran", "catat_tipe_keluar").row()
@@ -774,6 +859,7 @@ bot.on("callback_query:data", async (ctx) => {
       }
 
       kb.text("✏️ Lainnya", "catat_kategori_✏️ Lainnya").text("❌ Batal", "batal");
+      await saveSession(chatId, sess);
       return ctx.editMessageText(`Pilih kategori pengeluaran:`, { parse_mode: "MarkdownV2", reply_markup: kb });
     } else {
       sess.step = "catat_pilih_sumber";
@@ -786,6 +872,7 @@ bot.on("callback_query:data", async (ctx) => {
       }
       if (rowCnt % 2 !== 0) kb.row();
       kb.text("❌ Batal", "batal");
+      await saveSession(chatId, sess);
       return ctx.editMessageText(`Pemasukan dari mana?`, { parse_mode: "MarkdownV2", reply_markup: kb });
     }
   }
@@ -796,6 +883,7 @@ bot.on("callback_query:data", async (ctx) => {
 
     if (!isSumber && chosen === "✏️ Lainnya") {
       sess.step = "catat_input_kategori";
+      await saveSession(chatId, sess);
       return ctx.editMessageText(`Ketik nama kategori pengeluaran Anda:\n_Contoh: Sedekah_`, { parse_mode: "MarkdownV2" });
     }
 
@@ -803,21 +891,25 @@ bot.on("callback_query:data", async (ctx) => {
     else sess.category = chosen;
 
     sess.step = "catat_nominal";
+    await saveSession(chatId, sess);
     return ctx.editMessageText(`💵 Masukkan nominal:\n_Contoh: 25000 / 25rb / 1jt_`, { parse_mode: "MarkdownV2" });
   }
 
   if (data === "catat_isi_keterangan") {
     sess.step = "catat_keterangan";
+    await saveSession(chatId, sess);
     return ctx.editMessageText(`Ketik keterangan:`, { parse_mode: "MarkdownV2" });
   }
 
   if (data === "catat_skip_keterangan") {
     sess.note = "";
+    await saveSession(chatId, sess);
     return sendCatatPreview(ctx, sess);
   }
 
   if (data === "catat_ubah_nominal") {
     sess.step = "catat_nominal";
+    await saveSession(chatId, sess);
     return ctx.editMessageText(`💵 Masukkan nominal:\n_Contoh: 25000 / 25rb / 1jt_`, { parse_mode: "MarkdownV2" });
   }
 
@@ -828,13 +920,93 @@ bot.on("callback_query:data", async (ctx) => {
     const icon = sess.type === "masuk" ? "⬆️" : "⬇️";
     const labelKategori = sess.type === "masuk" ? sess.source : sess.category;
 
-    clearSession(chatId);
+    await clearSession(chatId);
 
     const msg = `✅ *Transaksi Berhasil Dicatat\\!*\n──────────────────\n🏦 *${esc(acc.bank_name)}*\n${esc(icon)} ${esc(labelKategori)} — ${esc(formatRupiah(sess.amount))}\n${sess.note ? `📝 _${esc(sess.note)}_\n\n` : "\n"}💰 Saldo terkini: *${esc(formatRupiah(acc.balance))}*`;
 
     await ctx.editMessageText(msg, { parse_mode: "MarkdownV2" });
 
     return analyzeAndAlert(ctx, ctx.from.id);
+  }
+
+  // ── EDIT REKENING ─────────────────────────────────────────
+  if (data.startsWith("editrek_akun_")) {
+    const accId = parseInt(data.replace("editrek_akun_", ""));
+    const acc = await getAccountById(accId, ctx.from.id);
+    if (!acc) return ctx.editMessageText("⚠️ Rekening tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+    
+    sess.step = "editrek_pilih_aksi";
+    sess.accountId = accId;
+    sess.accountName = acc.bank_name;
+    sess.currentBalance = acc.balance;
+    await saveSession(chatId, sess);
+    
+    const kb = new InlineKeyboard()
+      .text("💰 Koreksi Saldo", "editrek_koreksi_saldo").row()
+      .text("🏷 Ganti Nama Rekening", "editrek_ganti_nama").row()
+      .text("❌ Batal", "batal");
+    
+    return ctx.editMessageText(
+      `✏️ *Edit Rekening*\n────────────────\n🏦 Rekening: *${esc(acc.bank_name)}*\n💰 Saldo saat ini: *${esc(formatRupiah(acc.balance))}*\n\nApa yang ingin diubah?`,
+      { parse_mode: "MarkdownV2", reply_markup: kb }
+    );
+  }
+
+  if (data === "editrek_koreksi_saldo") {
+    sess.step = "editrek_input_saldo";
+    await saveSession(chatId, sess);
+    return ctx.editMessageText(
+      `💰 *Masukkan saldo yang BENAR:*\n_Saldo saat ini: ${esc(formatRupiah(sess.currentBalance))}_\n\n_Contoh: 500000 / 500rb / 2jt_`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+
+  if (data === "editrek_ganti_nama") {
+    sess.step = "editrek_input_nama";
+    await saveSession(chatId, sess);
+    return ctx.editMessageText(
+      `🏷 *Masukkan nama rekening yang baru:*\n_Nama saat ini: ${esc(sess.accountName)}_\n\n_Contoh: BCA Utama, Dana Darurat_`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+
+  if (data === "editrek_simpan_saldo") {
+    const oldBalance = sess.currentBalance;
+    const newBalance = sess.newBalance;
+    
+    if (newBalance === oldBalance) {
+      await clearSession(chatId);
+      return ctx.editMessageText(`ℹ️ Saldo tidak berubah\\.`, { parse_mode: "MarkdownV2" });
+    }
+    
+    // Update account balance
+    await updateAccountBalance(sess.accountId, ctx.from.id, newBalance);
+    
+    // Record correction transaction
+    const diff = newBalance - oldBalance;
+    const type = diff > 0 ? "masuk" : "keluar";
+    const amount = Math.abs(diff);
+    await addTransaction(ctx.from.id, sess.accountId, type, amount, "Koreksi saldo manual", "⚙️ Koreksi", "");
+    
+    await clearSession(chatId);
+    
+    return ctx.editMessageText(
+      `✅ *Saldo Berhasil Diperbarui\\!*\n────────────────\n🏦 ${esc(sess.accountName)}\n💰 Saldo baru: *${esc(formatRupiah(newBalance))}*`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
+
+  if (data === "editrek_simpan_nama") {
+    const oldName = sess.accountName;
+    const newName = sess.newName;
+    
+    await updateAccountName(sess.accountId, ctx.from.id, newName);
+    await clearSession(chatId);
+    
+    return ctx.editMessageText(
+      `✅ *Nama Rekening Berhasil Diubah\\!*\n────────────────\n💳 ${esc(oldName)} → *${esc(newName)}*`,
+      { parse_mode: "MarkdownV2" }
+    );
   }
 });
 
@@ -845,7 +1017,7 @@ bot.on("message:text", async (ctx) => {
 
   const chatId = ctx.chat.id;
   const text = ctx.message.text.trim();
-  const sess = getSession(chatId);
+  const sess = await getSession(chatId);
 
   // Security: Input length validation
   const MAX_LENGTHS = {
@@ -856,6 +1028,8 @@ bot.on("message:text", async (ctx) => {
     catat_input_kategori:  30,
     catat_nominal:         20,
     catat_keterangan:     100,
+    editrek_input_saldo:   20,
+    editrek_input_nama:    50,
   };
 
   const maxLen = MAX_LENGTHS[sess.step];
@@ -869,6 +1043,7 @@ bot.on("message:text", async (ctx) => {
   if (sess.step === "tambahbank_nama") {
     sess.bankName = text;
     sess.step = "tambahbank_saldo";
+    await saveSession(chatId, sess);
     return ctx.reply(`💳 Nama rekening: *${esc(text)}*\n\nSekarang ketik *saldo awal* rekening ini:\n_Contoh: 500000 / 500rb / 2jt_`, { parse_mode: "MarkdownV2" });
   }
 
@@ -876,13 +1051,13 @@ bot.on("message:text", async (ctx) => {
     const nominal = parseNominal(text);
     if (!isValidNominal(nominal)) return ctx.reply(`⚠️ Nominal tidak valid\\. Coba lagi:\n_Contoh: 500000 / 500rb / 2jt_`, { parse_mode: "MarkdownV2" });
     await addAccount(ctx.from.id, sess.bankName, nominal);
-    clearSession(chatId);
+    await clearSession(chatId);
     return ctx.reply(`✅ *Rekening Berhasil Ditambahkan\\!*\n\n🏦 Bank: *${esc(sess.bankName)}*\n💰 Saldo Awal: *${esc(formatRupiah(nominal))}*\n\nGunakan /catat untuk mulai mencatat transaksi\\.`, { parse_mode: "MarkdownV2" });
   }
 
   if (sess.step === "tambahkategori_nama") {
     await addCustomCategory(ctx.from.id, text);
-    clearSession(chatId);
+    await clearSession(chatId);
     return ctx.reply(`✅ Kategori *${esc(text)}* berhasil ditambahkan\\!`, { parse_mode: "MarkdownV2" });
   }
 
@@ -890,7 +1065,7 @@ bot.on("message:text", async (ctx) => {
     const nominal = parseNominal(text);
     if (text === "0" || isValidNominal(nominal)) {
       await updateDailyLimit(ctx.from.id, text === "0" ? 0 : nominal);
-      clearSession(chatId);
+      await clearSession(chatId);
       return ctx.reply(`✅ Batas pengeluaran harian berhasil diatur ke: *${esc(text === "0" ? "Tidak Terbatas" : formatRupiah(nominal))}*`, { parse_mode: "MarkdownV2" });
     }
     return ctx.reply(`⚠️ Nominal tidak valid\\. Coba lagi:\n_Contoh: 150000 / 150rb_`, { parse_mode: "MarkdownV2" });
@@ -899,6 +1074,7 @@ bot.on("message:text", async (ctx) => {
   if (sess.step === "catat_input_kategori") {
     sess.category = text;
     sess.step = "catat_nominal";
+    await saveSession(chatId, sess);
     await upsertCategorySuggestion(ctx.from.id, text);
     return ctx.reply(`💵 Masukkan nominal:\n_Contoh: 25000 / 25rb / 1jt_`, { parse_mode: "MarkdownV2" });
   }
@@ -909,6 +1085,7 @@ bot.on("message:text", async (ctx) => {
 
     sess.amount = nominal;
     sess.step = "catat_keterangan_prompt";
+    await saveSession(chatId, sess);
 
     const kb = new InlineKeyboard()
       .text("✏️ Tambah Keterangan", "catat_isi_keterangan")
@@ -918,7 +1095,52 @@ bot.on("message:text", async (ctx) => {
 
   if (sess.step === "catat_keterangan") {
     sess.note = text;
+    await saveSession(chatId, sess);
     return sendCatatPreview(ctx, sess);
+  }
+
+  // ── EDIT REKENING TEXT INPUTS ──────────────────────────────
+  if (sess.step === "editrek_input_saldo") {
+    const nominal = parseNominal(text);
+    if (!isValidNominal(nominal) && nominal !== 0) {
+      return ctx.reply(`⚠️ Nominal tidak valid\\. Coba lagi:\n_Contoh: 500000 / 500rb / 2jt_`, { parse_mode: "MarkdownV2" });
+    }
+    
+    sess.newBalance = nominal;
+    const oldBalance = sess.currentBalance;
+    const diff = nominal - oldBalance;
+    const selisih = diff >= 0 ? `\\+${esc(formatRupiah(diff))}` : `\\-${esc(formatRupiah(Math.abs(diff)))}`;
+    
+    sess.step = "editrek_konfirmasi_saldo";
+    await saveSession(chatId, sess);
+    
+    const kb = new InlineKeyboard()
+      .text("✅ Ya, Ubah Saldo", "editrek_simpan_saldo").row()
+      .text("❌ Batal", "batal");
+    
+    return ctx.reply(
+      `🔍 *Konfirmasi Perubahan Saldo*\n────────────────\n🏦 Rekening: *${esc(sess.accountName)}*\n💰 Saldo Lama: *${esc(formatRupiah(oldBalance))}*\n✅ Saldo Baru: *${esc(formatRupiah(nominal))}*\n📊 Selisih: ${selisih}`,
+      { parse_mode: "MarkdownV2", reply_markup: kb }
+    );
+  }
+
+  if (sess.step === "editrek_input_nama") {
+    if (text.length < 2 || text.length > 50) {
+      return ctx.reply(`⚠️ Nama harus 2\\-50 karakter\\.`, { parse_mode: "MarkdownV2" });
+    }
+    
+    sess.newName = text;
+    sess.step = "editrek_konfirmasi_nama";
+    await saveSession(chatId, sess);
+    
+    const kb = new InlineKeyboard()
+      .text("✅ Ya, Ubah Nama", "editrek_simpan_nama").row()
+      .text("❌ Batal", "batal");
+    
+    return ctx.reply(
+      `🔍 *Konfirmasi Perubahan Nama*\n────────────────\n💳 Nama Lama: *${esc(sess.accountName)}*\n✅ Nama Baru: *${esc(text)}*`,
+      { parse_mode: "MarkdownV2", reply_markup: kb }
+    );
   }
 });
 
