@@ -6,7 +6,9 @@ import {
   getRecentTransactions, addCustomCategory, getCustomCategories,
   getUserSettings, updateDailyLimit, getDailySpend, getWeeklySpend,
   getAlertLog, logAlert, getTransactionsByDateRange,
-  getTransactionsForCurrentMonth, getTransactionsForCurrentWeek
+  getTransactionsForCurrentMonth, getTransactionsForCurrentWeek,
+  getCategorySuggestions, upsertCategorySuggestion, updateSmartLimit,
+  updateLimitRecalcTime, getAlertLogWithCooldown, getTransactionsByDayGrouped
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 
@@ -27,8 +29,8 @@ function clearSession(chatId) {
 
 // ── CONSTANTS ─────────────────────────────────────────────────
 const defaultExpenseCategories = [
-  "🍔 Makanan", "🥤 Minuman", "🚗 Transport", "👗 Gaya Hidup",
-  "🏠 Tagihan", "🎮 Hiburan", "💊 Kesehatan", "📦 Lainnya"
+  "🍔 Makanan", "🥤 Minuman", "🚗 Transport", "🏠 Tagihan",
+  "👗 Gaya Hidup", "🎮 Hiburan", "💊 Kesehatan"
 ];
 
 const defaultIncomeSources = [
@@ -70,74 +72,210 @@ function isValidNominal(val) {
   return !isNaN(val) && val > 0;
 }
 
+// ── ML SMART LIMIT ─────────────────────────────────────────────
+async function calculateSmartLimit(telegramId) {
+  const settings = await getUserSettings(telegramId);
+  const now = new Date();
+
+  // Recalculate only if > 7 days since last recalc AND not custom
+  if (settings.limit_mode === 'custom') return settings.daily_limit;
+
+  if (settings.last_recalc) {
+    const lastDate = new Date(settings.last_recalc + "Z");
+    const diffDays = Math.floor((now - lastDate) / (1000 * 60 * 60 * 24));
+    // If not first time and hasn't been 7 days, skip
+    if (settings.daily_limit > 0 && diffDays < 7) {
+      return settings.daily_limit;
+    }
+  }
+
+  const grouped = await getTransactionsByDayGrouped(telegramId, 30);
+
+  let smartLimit = 0;
+
+  if (grouped.length < 7) {
+    // Bootstrap mode
+    const accounts = await getAccounts(telegramId);
+    const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
+    smartLimit = (totalBalance * 0.20) / 30;
+  } else {
+    // ML mode
+    const values = grouped.map(g => g.daily_total);
+    const n = values.length;
+    const sum = values.reduce((a, b) => a + b, 0);
+    const mean = sum / n;
+
+    // Variance & Volatility (StdDev)
+    const variance = values.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / n;
+    const volatility = Math.sqrt(variance);
+
+    let coeff = 0.95;
+    // Need at least 21 days for 3 blocks of 7 days etc.
+    // The instructions say 3 blocks of 10 days each -> needs 30 days total ideally
+    // We will do our best with what we have
+    if (grouped.length >= 21) {
+      // Oldest to newest (grouped is ascending order)
+      const b1 = values.slice(0, Math.floor(n / 3));
+      const b2 = values.slice(Math.floor(n / 3), Math.floor(2 * n / 3));
+      const b3 = values.slice(Math.floor(2 * n / 3));
+
+      const avg1 = b1.reduce((a, b) => a + b, 0) / (b1.length || 1);
+      const avg2 = b2.reduce((a, b) => a + b, 0) / (b2.length || 1);
+      const avg3 = b3.reduce((a, b) => a + b, 0) / (b3.length || 1);
+
+      if (avg3 > avg2 && avg2 > avg1) coeff = 0.85; // Rising -> tighten
+      else if (avg3 < avg2 && avg2 < avg1) coeff = 1.05; // Falling -> loosen
+    }
+
+    let safetyMargin = 1 - (mean > 0 ? (volatility / mean * 0.3) : 0);
+    safetyMargin = Math.max(0.7, Math.min(1.0, safetyMargin)); // Clamp 0.7 - 1.0
+
+    smartLimit = mean * coeff * safetyMargin;
+  }
+
+  // Income ratio guard
+  if (settings.monthly_income > 0) {
+    const maxMonthlySpend = settings.monthly_income * 0.70;
+    const incomeBasedLimit = maxMonthlySpend / 30;
+    if (smartLimit > incomeBasedLimit) smartLimit = incomeBasedLimit;
+  }
+
+  await updateSmartLimit(telegramId, smartLimit);
+  return smartLimit;
+}
+
 // ── SMART ALERT SYSTEM ─────────────────────────────────────────
-async function checkAndSendAlerts(ctx, telegramId) {
+async function analyzeAndAlert(ctx, telegramId) {
   try {
     const todaySpend = await getDailySpend(telegramId);
-    const settings = await getUserSettings(telegramId);
 
-    // Alert 1: Daily Overspend
-    let dailyLimit = settings.daily_limit;
-    if (!dailyLimit || dailyLimit === 0) {
-      const last30 = await getTransactionsByDateRange(telegramId, 'keluar', 30);
-      const sum30 = last30.reduce((acc, tx) => acc + tx.amount, 0);
-      const avg30 = sum30 / 30;
-      dailyLimit = avg30 * 1.5;
-    }
+    // Always recalculate Smart Limit for up-to-date data
+    const dailyLimit = await calculateSmartLimit(telegramId);
 
-    if (dailyLimit > 0 && todaySpend > dailyLimit) {
-      const alertedText = `daily_overspend_${new Date().toISOString().split('T')[0]}`;
-      const hasAlerted = await getAlertLog(telegramId, alertedText);
-      if (!hasAlerted) {
-        await logAlert(telegramId, alertedText);
-        await ctx.reply(
-          `⚠️ *Alert Pengeluaran Harian\\!*\n` +
-          `Pengeluaran hari ini: *${esc(formatRupiah(todaySpend))}*\n` +
-          `Batas harian kamu: *${esc(formatRupiah(dailyLimit))}*\n` +
-          `Kamu sudah melebihi batas *${esc(formatRupiah(dailyLimit))}*`,
-          { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard }
-        );
-      }
-    }
-
-    // Alert 2: Low balance
+    // Get stats
     const accounts = await getAccounts(telegramId);
-    for (const acc of accounts) {
-      if (acc.initial_balance > 0 && acc.balance < acc.initial_balance * 0.2) {
-        const alertedText = `low_balance_${acc.id}_${new Date().toISOString().split('T')[0]}`;
-        const hasAlerted = await getAlertLog(telegramId, alertedText);
-        if (!hasAlerted) {
-          await logAlert(telegramId, alertedText);
-          const pct = Math.round((acc.balance / acc.initial_balance) * 100);
-          await ctx.reply(
-            `🔴 *Saldo Menipis\\!*\n` +
-            `Rekening *${esc(acc.bank_name)}*: *${esc(formatRupiah(acc.balance))}*\n` +
-            `Hanya tersisa ${esc(pct.toString())}% dari saldo awal`,
-            { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard }
-          );
-        }
-      }
-    }
+    const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
+    const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
 
-    // Alert 3: Weekly overspend
     const thisWeek = await getWeeklySpend(telegramId, 0);
     const lastWeek = await getWeeklySpend(telegramId, 1);
 
-    if (lastWeek > 0 && thisWeek > lastWeek * 1.2) {
-      const weeklyAlertText = `weekly_overspend_${new Date().toISOString().split('T')[0]}`;
-      const hasAlerted = await getAlertLog(telegramId, weeklyAlertText);
-      if (!hasAlerted) {
-        await logAlert(telegramId, weeklyAlertText);
-        const limitStr = Math.round(((thisWeek - lastWeek) / lastWeek) * 100);
-        await ctx.reply(
-          `📊 *Pengeluaran Minggu Ini Melonjak\\!*\n` +
-          `Minggu ini: *${esc(formatRupiah(thisWeek))}*\n` +
-          `Minggu lalu: *${esc(formatRupiah(lastWeek))}*\n` +
-          `Naik ${esc(limitStr.toString())}% — coba lebih hemat ya\\!`,
-          { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard }
-        );
+    const thisMonthTxs = await getTransactionsForCurrentMonth(telegramId);
+    let monthIncome = 0;
+    let monthSpend = 0;
+    for (const tx of thisMonthTxs) {
+      if (tx.type === "masuk") monthIncome += tx.amount;
+      else monthSpend += tx.amount;
+    }
+
+    // ── SCORE CALCULATION ──
+    let score = 100;
+
+    // Factor 1: Daily Limit Usage (30pts)
+    let usageRatio = 0;
+    if (dailyLimit > 0) {
+      usageRatio = todaySpend / dailyLimit;
+      if (usageRatio > 1.0) score -= 30;
+      else if (usageRatio > 0.8) score -= 15;
+      else if (usageRatio > 0.6) score -= 5;
+    }
+
+    // Factor 2: Balance Health (25pts)
+    let balanceRatio = 1.0;
+    if (totalInitialBalance > 0) {
+      balanceRatio = totalBalance / totalInitialBalance;
+      if (balanceRatio < 0.10) score -= 25;
+      else if (balanceRatio < 0.25) score -= 15;
+      else if (balanceRatio < 0.50) score -= 8;
+    }
+
+    // Factor 3: Weekly Trend (25pts)
+    if (lastWeek > 0) {
+      if (thisWeek > lastWeek * 1.3) score -= 25;
+      else if (thisWeek > lastWeek * 1.1) score -= 10;
+    }
+
+    // Factor 4: Saving Behavior (20pts)
+    let savingRate = 0;
+    if (monthIncome > 0) {
+      savingRate = (monthIncome - monthSpend) / monthIncome;
+      if (savingRate < 0) score -= 20;
+      else if (savingRate < 0.1) score -= 10;
+      else if (savingRate > 0.3) score += 5;
+    }
+
+    // Clamp score
+    score = Math.max(0, Math.min(100, score));
+
+    // Emoji Mapping
+    let scoreEmoji = "🔴 Kritis";
+    if (score >= 90) scoreEmoji = "💚 Sangat Sehat";
+    else if (score >= 70) scoreEmoji = "🟡 Cukup Baik";
+    else if (score >= 50) scoreEmoji = "🟠 Perlu Perhatian";
+
+    // ── PROGRESS BAR ──
+    const rawBarRatio = dailyLimit > 0 ? todaySpend / dailyLimit : 0;
+    const filled = Math.min(10, Math.round(rawBarRatio * 10));
+    const barStr = '█'.repeat(filled) + '░'.repeat(10 - filled);
+    const pctStr = dailyLimit > 0 ? Math.min(999, Math.round(rawBarRatio * 100)) : 0;
+
+    // ── SMART ADVICE ──
+    let advice = "Catat setiap transaksi untuk analisis yang lebih akurat\\.";
+    if (score < 50) advice = "Kondisi keuanganmu kritis\\. Tunda pengeluaran non\\-esensial\\.";
+    else if (score < 70 && lastWeek > 0 && thisWeek > lastWeek) advice = "Belanjamu meningkat pesat\\. Coba terapkan aturan 50/30/20\\.";
+    else if (dailyLimit > 0 && todaySpend > dailyLimit) advice = "Limit harian terlampaui\\. Hindari pengeluaran sampai besok\\.";
+    else if (totalInitialBalance > 0 && balanceRatio < 0.25) advice = "Saldo tinggal 25%\\. Prioritaskan kebutuhan pokok saja\\.";
+    else if (savingRate > 0.3) advice = "Hebat\\! Tabunganmu bulan ini di atas 30%\\. Pertahankan\\!";
+    else if (usageRatio < 0.5 && score > 80) advice = "Pengeluaran terkendali\\. Keuanganmu sehat hari ini\\.";
+
+    // ── ALERTS CHECK ──
+    let alertBlocks = "";
+
+    // Limit Alert (daily cooldown)
+    if (dailyLimit > 0 && todaySpend > dailyLimit * 0.8) {
+      const type = `alert_limit_${new Date().toISOString().split('T')[0]}`;
+      const logged = await getAlertLogWithCooldown(telegramId, type, 24);
+      if (!logged) {
+        await logAlert(telegramId, type);
+        alertBlocks += `⚠️ *LIMIT HARIAN* hampir / sudah habis\\.\n`;
       }
     }
+
+    // Balance Alert (6 hours cooldown)
+    if (totalInitialBalance > 0 && balanceRatio < 0.25) {
+      const type = `alert_balance`;
+      const logged = await getAlertLogWithCooldown(telegramId, type, 6);
+      if (!logged) {
+        await logAlert(telegramId, type);
+        alertBlocks += `🔴 *SALDO MENIPIS* \\(Sisa < 25%\\)\\.\n`;
+      }
+    }
+
+    // Trend Alert (daily cooldown)
+    if (lastWeek > 0 && thisWeek > lastWeek * 1.1) {
+      const type = `alert_trend_${new Date().toISOString().split('T')[0]}`;
+      const logged = await getAlertLogWithCooldown(telegramId, type, 24);
+      if (!logged) {
+        await logAlert(telegramId, type);
+        alertBlocks += `📈 *TREN BOROS* naik pesat minggu ini\\.\n`;
+      }
+    }
+
+    // ── MESSAGE CONSTRUCTION ──
+    const remainingToSpend = Math.max(0, dailyLimit - todaySpend);
+    let msg = `📊 *Analisis Transaksi*\n─────────────────\n`;
+    msg += `🏦 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n\n`;
+    msg += `💸 Pengeluaran hari ini: *${esc(formatRupiah(todaySpend))}* / ${esc(formatRupiah(dailyLimit))}\n`;
+    msg += `\\[${esc(barStr)} ${esc(pctStr.toString())}%\\]\n\n`;
+    msg += `📅 Sisa hari ini: *${esc(formatRupiah(remainingToSpend))}*\n\n`;
+
+    if (alertBlocks) {
+      msg += `${esc(alertBlocks.trim())}\n\n`;
+    }
+    msg += `💡 *SARAN:* _${esc(advice)}_`;
+
+    await ctx.reply(msg, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
+
   } catch (err) {
     console.error("Alert Error:", err);
   }
@@ -237,6 +375,9 @@ bot.command("prediksi", async (ctx) => {
   const txs = await getTransactionsByDateRange(ctx.from.id, 'keluar', 30);
   if (txs.length === 0) return ctx.reply(`🔮 Belum ada data pengeluaran 30 hari terakhir\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
 
+  // Get Smart Limit which already calculates ML background
+  const smartDailyLimit = await calculateSmartLimit(ctx.from.id);
+
   let total30 = 0, last7 = 0, prev7 = 0;
   const categoryMap = new Map();
   const now = new Date();
@@ -246,7 +387,6 @@ bot.command("prediksi", async (ctx) => {
     const cat = tx.category || "Lainnya";
     categoryMap.set(cat, (categoryMap.get(cat) || 0) + tx.amount);
 
-    // approximate difference in days
     const txDate = new Date(tx.created_at + "Z");
     const diffDays = Math.floor((now - txDate) / (1000 * 60 * 60 * 24));
 
@@ -259,40 +399,91 @@ bot.command("prediksi", async (ctx) => {
   const prev7Avg = prev7 / 7;
 
   let trendStr = "stabil";
+  let trendEmoji = "➖";
   let multiplier = 1.0;
   if (prev7Avg > 0) {
-    if (last7Avg > prev7Avg) { trendStr = "meningkat"; multiplier = 1.1; }
-    else if (last7Avg < prev7Avg) { trendStr = "menurun"; multiplier = 0.9; }
+    if (last7Avg > prev7Avg) { trendStr = "meningkat"; trendEmoji = "📈"; multiplier = 1.1; }
+    else if (last7Avg < prev7Avg) { trendStr = "menurun"; trendEmoji = "📉"; multiplier = 0.9; }
   }
 
-  const adjustedDaily = avg30 * multiplier || 1;
   const accounts = await getAccounts(ctx.from.id);
   const totalBalance = accounts.reduce((sum, acc) => sum + acc.balance, 0);
 
-  const daysUntilEmpty = Math.floor(totalBalance / adjustedDaily);
+  // Exact Days to empty using Smart Limit (adjusted)
+  const daysUntilEmpty = smartDailyLimit > 0 ? Math.floor(totalBalance / smartDailyLimit) : 999;
   const predictedDate = new Date();
   predictedDate.setDate(predictedDate.getDate() + daysUntilEmpty);
 
   const sortedCats = Array.from(categoryMap.entries()).sort((a, b) => b[1] - a[1]);
 
-  let advice = "Keuanganmu dalam kondisi aman\\. Pertahankan\\!";
-  if (daysUntilEmpty < 7) advice = "Saldo kamu kritis\\! Kurangi pengeluaran segera\\.";
-  else if (daysUntilEmpty < 14) advice = "Saldo akan habis dalam 2 minggu\\. Hati\\-hati\\!";
-  else if (trendStr === "meningkat" && multiplier > 1.05) advice = "Pengeluaranmu meningkat pesat minggu ini\\.";
+  // Copy calculate Score directly for isolated view
+  let score = 100;
+  const todaySpend = await getDailySpend(ctx.from.id);
+  if (smartDailyLimit > 0) {
+    let usageRatio = todaySpend / smartDailyLimit;
+    if (usageRatio > 1.0) score -= 30;
+    else if (usageRatio > 0.8) score -= 15;
+    else if (usageRatio > 0.6) score -= 5;
+  }
+  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
+  if (totalInitialBalance > 0) {
+    let balanceRatio = totalBalance / totalInitialBalance;
+    if (balanceRatio < 0.10) score -= 25;
+    else if (balanceRatio < 0.25) score -= 15;
+    else if (balanceRatio < 0.50) score -= 8;
+  }
+  const thisWeek = await getWeeklySpend(ctx.from.id, 0);
+  const lastWeek = await getWeeklySpend(ctx.from.id, 1);
+  if (lastWeek > 0) {
+    if (thisWeek > lastWeek * 1.3) score -= 25;
+    else if (thisWeek > lastWeek * 1.1) score -= 10;
+  }
+  const thisMonthTxs = await getTransactionsForCurrentMonth(ctx.from.id);
+  let monthIncome = 0;
+  let monthSpend = 0;
+  for (const tx of thisMonthTxs) {
+    if (tx.type === "masuk") monthIncome += tx.amount;
+    else monthSpend += tx.amount;
+  }
+  let savingRate = 0;
+  if (monthIncome > 0) {
+    savingRate = (monthIncome - monthSpend) / monthIncome;
+    if (savingRate < 0) score -= 20;
+    else if (savingRate < 0.1) score -= 10;
+    else if (savingRate > 0.3) score += 5;
+  }
+  score = Math.max(0, Math.min(100, score));
 
-  let text = `🔮 *Prediksi Keuangan MyDuit*\n──────────────────\n`;
-  text += `💸 Rata\\-rata pengeluaran harian: *${esc(formatRupiah(avg30))}*\n`;
-  text += `📈 Tren belanja: *${esc(trendStr)}*\n`;
-  text += `📅 Estimasi saldo habis: *${esc(formatDate(predictedDate.toISOString().split('T')[0]))}* \\(${esc(daysUntilEmpty.toString())} hari lagi\\)\n\n`;
+  let scoreEmoji = "🔴";
+  if (score >= 90) scoreEmoji = "💚";
+  else if (score >= 70) scoreEmoji = "🟡";
+  else if (score >= 50) scoreEmoji = "🟠";
 
-  text += `🏆 *Top 3 kategori pengeluaran:*\n`;
+  let advice = "Catat setiap transaksi untuk analisis yang lebih akurat\\.";
+  if (score < 50) advice = "Kondisi keuanganmu kritis\\. Tunda pengeluaran non\\-esensial\\.";
+  else if (score < 70 && trendStr === "meningkat") advice = "Belanjamu meningkat pesat\\. Coba terapkan aturan 50/30/20\\.";
+  else if (smartDailyLimit > 0 && todaySpend > smartDailyLimit) advice = "Limit harian terlampaui\\. Hindari pengeluaran sampai besok\\.";
+  else if (totalInitialBalance > 0 && (totalBalance / totalInitialBalance) < 0.25) advice = "Saldo tinggal 25%\\. Prioritaskan kebutuhan pokok saja\\.";
+  else if (savingRate > 0.3) advice = "Hebat\\! Tabunganmu bulan ini di atas 30%\\. Pertahankan\\!";
+  else if (smartDailyLimit > 0 && (todaySpend / smartDailyLimit) < 0.5 && score > 80) advice = "Pengeluaran terkendali\\. Keuanganmu sehat hari ini\\.";
+
+  let text = `🔮 *Prediksi Keuangan MyDuit*\n─────────────────\n`;
+  text += `💰 Total saldo: *${esc(formatRupiah(totalBalance))}*\n`;
+  text += `💸 Rata\\-rata harian: *${esc(formatRupiah(avg30))}*\n`;
+  text += `� Tren: *${esc(trendStr)}* ${esc(trendEmoji)}\n\n`;
+
+  text += `📅 Estimasi saldo habis:\n*${esc(formatDate(predictedDate.toISOString().split('T')[0]))}* \\(${esc(daysUntilEmpty.toString())} hari lagi\\)\n\n`;
+
+  text += `🏆 *Top 3 Pengeluaran Bulan Ini:*\n`;
   for (let i = 0; i < Math.min(3, sortedCats.length); i++) {
     const [name, amt] = sortedCats[i];
     const pct = Math.round((amt / total30) * 100);
     text += `${i + 1}\\. ${esc(name)} — ${esc(formatRupiah(amt))} \\(${esc(pct.toString())}%\\)\n`;
   }
 
-  text += `\n⚠️ _${esc(advice)}_`;
+  text += `\n🎯 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n`;
+  text += `💡 _${esc(advice)}_`;
+
   await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
 });
 
@@ -305,13 +496,19 @@ async function generateReport(ctx, isMonthly) {
 
   let totalIn = 0, totalOut = 0;
   const cats = new Map();
-  const sources = new Map();
+
+  // Get Period Start/End Dates safely formatting
+  let periodStart = new Date();
+  let periodEnd = new Date();
+  if (txs.length > 0) {
+    const dates = txs.map(t => new Date(t.created_at + "Z"));
+    periodStart = new Date(Math.min(...dates));
+    periodEnd = new Date(Math.max(...dates));
+  }
 
   for (const tx of txs) {
     if (tx.type === "masuk") {
       totalIn += tx.amount;
-      const s = tx.source || "Lainnya";
-      sources.set(s, (sources.get(s) || 0) + tx.amount);
     } else {
       totalOut += tx.amount;
       const c = tx.category || "Lainnya";
@@ -321,33 +518,58 @@ async function generateReport(ctx, isMonthly) {
 
   const diff = totalIn - totalOut;
   const title = isMonthly ? "Bulan" : "Minggu";
-  const emojiSummary = diff > 0 ? "👍 Bagus\\! Kamu berhasil menabung periode ini\\." : (diff < 0 ? "⚠️ Pengeluaranmu lebih besar dari pemasukan\\." : "⚖️ Pemasukan dan pengeluaran seimbang\\.");
+  const savingRate = totalIn > 0 ? ((totalIn - totalOut) / totalIn) : 0;
 
-  let text = `📊 *Laporan ${title} MyDuit*\n──────────────────\n`;
-  text += `💰 Total Pemasukan:  *${esc(formatRupiah(totalIn))}*\n`;
-  text += `💸 Total Pengeluaran: *${esc(formatRupiah(totalOut))}*\n`;
-  text += `📈 Selisih \\(Nabung\\):  *${esc(formatRupiah(diff))}*\n\n`;
+  // Calculate Score for Report
+  let score = 100;
+  const smartDailyLimit = await calculateSmartLimit(telegramId);
+  const todaySpend = await getDailySpend(telegramId);
+  if (smartDailyLimit > 0) {
+    let usageRatio = todaySpend / smartDailyLimit;
+    if (usageRatio > 1.0) score -= 30; else if (usageRatio > 0.8) score -= 15; else if (usageRatio > 0.6) score -= 5;
+  }
+  const accounts = await getAccounts(telegramId);
+  const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
+  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
+  if (totalInitialBalance > 0) {
+    let balanceRatio = totalBalance / totalInitialBalance;
+    if (balanceRatio < 0.10) score -= 25; else if (balanceRatio < 0.25) score -= 15; else if (balanceRatio < 0.50) score -= 8;
+  }
+  const thisWeek = await getWeeklySpend(telegramId, 0);
+  const lastWeek = await getWeeklySpend(telegramId, 1);
+  if (lastWeek > 0) {
+    if (thisWeek > lastWeek * 1.3) score -= 25; else if (thisWeek > lastWeek * 1.1) score -= 10;
+  }
+  if (savingRate < 0) score -= 20; else if (savingRate < 0.1) score -= 10; else if (savingRate > 0.3) score += 5;
+  score = Math.max(0, Math.min(100, score));
+
+  // Period Advice based on Savings
+  let msgAdvice = "Coba simpan uangmu lebih baik lagi periode depan\\.";
+  if (savingRate > 0.3) msgAdvice = "Pengelolaan uang yang sangat baik\\! Lanjutkan di periode berikutnya\\.";
+  else if (savingRate > 0.1) msgAdvice = "Cukup baik, tapi kamu masih bisa lebih efisien\\!";
+  else if (savingRate < 0) msgAdvice = "Pengeluaran membengkak dari pemasukan\\. Segera perbaiki keuanganmu\\!";
+
+  let text = `📊 *Laporan ${title} MyDuit*\n`;
+  text += `Periode: ${esc(formatDate(periodStart.toISOString().split('T')[0]))} \\- ${esc(formatDate(periodEnd.toISOString().split('T')[0]))}\n─────────────────\n`;
+  text += `💰 Pemasukan:    *${esc(formatRupiah(totalIn))}*\n`;
+  text += `💸 Pengeluaran:  *${esc(formatRupiah(totalOut))}*\n`;
+  text += `📈 Selisih:      *${esc(formatRupiah(diff))}*\n`;
+  const svPct = Math.round(savingRate * 100);
+  text += `💾 Saving rate:  *${esc(svPct.toString())}%*\n\n`;
 
   if (cats.size > 0) {
-    text += `📂 *Pengeluaran per Kategori:*\n`;
+    text += `📂 *Per Kategori:*\n`;
     const sortedCats = Array.from(cats.entries()).sort((a, b) => b[1] - a[1]);
     for (const [name, amt] of sortedCats) {
       const pct = Math.round((amt / totalOut) * 100);
-      text += `• ${esc(name)}    ${esc(formatRupiah(amt))}  \\(${esc(pct.toString())}%\\)\n`;
+      text += `• ${esc(name)}    ${esc(formatRupiah(amt))} \\(${esc(pct.toString())}%\\)\n`;
     }
     text += `\n`;
   }
 
-  if (sources.size > 0) {
-    text += `📥 *Sumber Pemasukan:*\n`;
-    const sortedSources = Array.from(sources.entries()).sort((a, b) => b[1] - a[1]);
-    for (const [name, amt] of sortedSources) {
-      text += `• ${esc(name)}    ${esc(formatRupiah(amt))}\n`;
-    }
-    text += `\n`;
-  }
+  text += `🎯 Skor Rata\\-rata: *${esc(score.toString())}/100*\n`;
+  text += `💡 _${esc(msgAdvice)}_`;
 
-  text += `${esc(emojiSummary)}`;
   await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
 }
 
@@ -433,7 +655,12 @@ bot.on("callback_query:data", async (ctx) => {
   }
 
   if (data.startsWith("catat_kategori_")) {
-    sess.category = data.replace("catat_kategori_", "");
+    const chosenCat = data.replace("catat_kategori_", "");
+    if (chosenCat === "✏️ Lainnya") {
+      sess.step = "catat_kategori_manual";
+      return ctx.editMessageText(`Ketik nama kategori pengeluaran Anda:\n_Contoh: Sedekah_`, { parse_mode: "MarkdownV2" });
+    }
+    sess.category = chosenCat;
     sess.step = "catat_keterangan";
     return ctx.editMessageText(`Kategori: *${esc(sess.category)}*\n\nTambahkan keterangan \\(opsional\\):\n_Contoh: Makan siang_\n\nAtau ketik /skip untuk lewati`, { parse_mode: "MarkdownV2" });
   }
@@ -501,16 +728,39 @@ bot.on("message:text", async (ctx) => {
     } else {
       sess.step = "catat_kategori_pilih";
       const customCats = await getCustomCategories(ctx.from.id);
+      const suggestionsRows = await getCategorySuggestions(ctx.from.id);
+
       const allCats = [...defaultExpenseCategories, ...customCats.map(c => `${c.emoji} ${c.name}`)];
+      const suggestions = suggestionsRows.map(c => c.name);
+
       const kb = new InlineKeyboard();
+
+      // Default & custom user explicitly added
       let rowCnt = 0;
       for (const c of allCats) {
         kb.text(c, `catat_kategori_${c}`);
         rowCnt++;
         if (rowCnt % 2 === 0) kb.row();
       }
+      if (rowCnt % 2 !== 0) kb.row();
+
+      // Auto-suggested ML categories
+      for (const s of suggestions) {
+        kb.text(`⭐ ${s}`, `catat_kategori_${s}`);
+        kb.row();
+      }
+
+      kb.text("✏️ Lainnya", "catat_kategori_✏️ Lainnya");
+
       return ctx.reply(`Pilih kategori pengeluaran:`, { parse_mode: "MarkdownV2", reply_markup: kb });
     }
+  }
+
+  if (sess.step === "catat_kategori_manual") {
+    sess.category = text;
+    sess.step = "catat_keterangan";
+    await upsertCategorySuggestion(ctx.from.id, text);
+    return ctx.reply(`Kategori: *${esc(sess.category)}*\n\nTambahkan keterangan \\(opsional\\):\n_Contoh: Makan siang_\n\nAtau ketik /skip untuk lewati`, { parse_mode: "MarkdownV2" });
   }
 
   if (sess.step === "catat_keterangan") {
@@ -525,7 +775,7 @@ bot.on("message:text", async (ctx) => {
     clearSession(chatId);
 
     // Check and send alerts after transaction
-    await checkAndSendAlerts(ctx, ctx.from.id);
+    await analyzeAndAlert(ctx, ctx.from.id);
 
     return ctx.reply(
       `✅ *Transaksi Dicatat\\!*\n\n` +
