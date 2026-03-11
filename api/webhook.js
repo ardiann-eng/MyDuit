@@ -12,11 +12,75 @@ import {
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 
+// ── SECURITY: VALIDATE REQUIRED ENV VARS ───────────────────────
+const requiredEnvVars = [
+  "TELEGRAM_BOT_TOKEN",
+  "TURSO_DATABASE_URL", 
+  "TURSO_AUTH_TOKEN"
+];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    throw new Error(`Missing required environment variable: ${envVar}`);
+  }
+}
+
 // ── INISIALISASI BOT ───────────────────────────────────────────
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
+// Initialize bot once at module level (outside handler)
+(async () => {
+  try {
+    await bot.init();
+  } catch (err) {
+    console.error("Bot init error:", err);
+  }
+})();
+
+// ── SECURITY: OPTIONAL PRIVATE BOT WHITELIST ──────────────────
+// Only apply if ALLOWED_USER_ID is set in env
+bot.use(async (ctx, next) => {
+  const allowedId = process.env.ALLOWED_USER_ID;
+  if (!allowedId) return next(); // skip if not set (public mode)
+  
+  const userId = String(ctx.from?.id || "");
+  const allowedIds = allowedId.split(",").map(id => id.trim());
+  
+  if (!allowedIds.includes(userId)) {
+    if (ctx.message) {
+      await ctx.reply("⛔ Bot ini bersifat pribadi.");
+    } else if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery("⛔ Akses ditolak.");
+    }
+    return; // stop processing
+  }
+  
+  return next();
+});
+
 // Session in-memory
 const sessions = new Map();
+
+// ── SECURITY: RATE LIMITING ────────────────────────────────────
+// Max 1 message per second per user
+const rateLimitMap = new Map();
+
+function isRateLimited(telegramId) {
+  const now = Date.now();
+  const last = rateLimitMap.get(String(telegramId)) || 0;
+  if (now - last < 1000) return true;
+  rateLimitMap.set(String(telegramId), now);
+  return false;
+}
+
+// DB Initialization caching
+let dbInitialized = false;
+
+async function ensureDB() {
+  if (!dbInitialized) {
+    await initDB();
+    dbInitialized = true;
+  }
+}
 
 function getSession(chatId) {
   if (!sessions.has(chatId)) sessions.set(chatId, {});
@@ -64,6 +128,70 @@ function parseNominal(text) {
 
 function isValidNominal(val) {
   return !isNaN(val) && val > 0;
+}
+
+// ── SCORE CALCULATION ──────────────────────────────────────────
+async function calculateScore(telegramId, dailyLimit) {
+  let score = 100;
+
+  // Get stats
+  const todaySpend = await getDailySpend(telegramId);
+  const accounts = await getAccounts(telegramId);
+  const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
+  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
+
+  // Factor 1: Daily Limit Usage (30pts)
+  let usageRatio = 0;
+  if (dailyLimit > 0) {
+    usageRatio = todaySpend / dailyLimit;
+    if (usageRatio > 1.0) score -= 30;
+    else if (usageRatio > 0.8) score -= 15;
+    else if (usageRatio > 0.6) score -= 5;
+  }
+
+  // Factor 2: Balance Health (25pts)
+  let balanceRatio = 1.0;
+  if (totalInitialBalance > 0) {
+    balanceRatio = totalBalance / totalInitialBalance;
+    if (balanceRatio < 0.10) score -= 25;
+    else if (balanceRatio < 0.25) score -= 15;
+    else if (balanceRatio < 0.50) score -= 8;
+  }
+
+  // Factor 3: Weekly Trend (25pts)
+  const thisWeek = await getWeeklySpend(telegramId, 0);
+  const lastWeek = await getWeeklySpend(telegramId, 1);
+  if (lastWeek > 0) {
+    if (thisWeek > lastWeek * 1.3) score -= 25;
+    else if (thisWeek > lastWeek * 1.1) score -= 10;
+  }
+
+  // Factor 4: Saving Behavior (20pts)
+  const thisMonthTxs = await getTransactionsForCurrentMonth(telegramId);
+  let monthIncome = 0;
+  let monthSpend = 0;
+  for (const tx of thisMonthTxs) {
+    if (tx.type === "masuk") monthIncome += tx.amount;
+    else monthSpend += tx.amount;
+  }
+  let savingRate = 0;
+  if (monthIncome > 0) {
+    savingRate = (monthIncome - monthSpend) / monthIncome;
+    if (savingRate < 0) score -= 20;
+    else if (savingRate < 0.1) score -= 10;
+    else if (savingRate > 0.3) score += 5;
+  }
+
+  // Clamp score
+  score = Math.max(0, Math.min(100, score));
+
+  // Emoji Mapping
+  let scoreEmoji = "🔴 Kritis";
+  if (score >= 90) scoreEmoji = "💚 Sangat Sehat";
+  else if (score >= 70) scoreEmoji = "🟡 Cukup Baik";
+  else if (score >= 50) scoreEmoji = "🟠 Perlu Perhatian";
+
+  return { score, scoreEmoji, savingRate, usageRatio, balanceRatio };
 }
 
 // ── ML SMART LIMIT ─────────────────────────────────────────────
@@ -141,71 +269,20 @@ async function calculateSmartLimit(telegramId) {
 // ── SMART ALERT SYSTEM ─────────────────────────────────────────
 async function analyzeAndAlert(ctx, telegramId) {
   try {
-    const todaySpend = await getDailySpend(telegramId);
-
     // Always recalculate Smart Limit for up-to-date data
     const dailyLimit = await calculateSmartLimit(telegramId);
+
+    // Get scorecard
+    const scorecard = await calculateScore(telegramId, dailyLimit);
+    const { score, scoreEmoji, savingRate, usageRatio, balanceRatio } = scorecard;
 
     // Get stats
     const accounts = await getAccounts(telegramId);
     const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
     const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
-
+    const todaySpend = await getDailySpend(telegramId);
     const thisWeek = await getWeeklySpend(telegramId, 0);
     const lastWeek = await getWeeklySpend(telegramId, 1);
-
-    const thisMonthTxs = await getTransactionsForCurrentMonth(telegramId);
-    let monthIncome = 0;
-    let monthSpend = 0;
-    for (const tx of thisMonthTxs) {
-      if (tx.type === "masuk") monthIncome += tx.amount;
-      else monthSpend += tx.amount;
-    }
-
-    // ── SCORE CALCULATION ──
-    let score = 100;
-
-    // Factor 1: Daily Limit Usage (30pts)
-    let usageRatio = 0;
-    if (dailyLimit > 0) {
-      usageRatio = todaySpend / dailyLimit;
-      if (usageRatio > 1.0) score -= 30;
-      else if (usageRatio > 0.8) score -= 15;
-      else if (usageRatio > 0.6) score -= 5;
-    }
-
-    // Factor 2: Balance Health (25pts)
-    let balanceRatio = 1.0;
-    if (totalInitialBalance > 0) {
-      balanceRatio = totalBalance / totalInitialBalance;
-      if (balanceRatio < 0.10) score -= 25;
-      else if (balanceRatio < 0.25) score -= 15;
-      else if (balanceRatio < 0.50) score -= 8;
-    }
-
-    // Factor 3: Weekly Trend (25pts)
-    if (lastWeek > 0) {
-      if (thisWeek > lastWeek * 1.3) score -= 25;
-      else if (thisWeek > lastWeek * 1.1) score -= 10;
-    }
-
-    // Factor 4: Saving Behavior (20pts)
-    let savingRate = 0;
-    if (monthIncome > 0) {
-      savingRate = (monthIncome - monthSpend) / monthIncome;
-      if (savingRate < 0) score -= 20;
-      else if (savingRate < 0.1) score -= 10;
-      else if (savingRate > 0.3) score += 5;
-    }
-
-    // Clamp score
-    score = Math.max(0, Math.min(100, score));
-
-    // Emoji Mapping
-    let scoreEmoji = "🔴 Kritis";
-    if (score >= 90) scoreEmoji = "💚 Sangat Sehat";
-    else if (score >= 70) scoreEmoji = "🟡 Cukup Baik";
-    else if (score >= 50) scoreEmoji = "🟠 Perlu Perhatian";
 
     // ── PROGRESS BAR ──
     const rawBarRatio = dailyLimit > 0 ? todaySpend / dailyLimit : 0;
@@ -415,28 +492,16 @@ async function handlePrediksi(ctx) {
 
   const sortedCats = Array.from(categoryMap.entries()).sort((a, b) => b[1] - a[1]);
 
-  // Copy calculate Score directly for isolated view
-  let score = 100;
+  // Calculate Score using shared function
+  const scorecard = await calculateScore(ctx.from.id, smartDailyLimit);
+  const { score, scoreEmoji: scoreEmojiBase } = scorecard;
+  let scoreEmoji = "🔴";
+  if (score >= 90) scoreEmoji = "💚";
+  else if (score >= 70) scoreEmoji = "🟡";
+  else if (score >= 50) scoreEmoji = "🟠";
+
+  // Get data for advice
   const todaySpend = await getDailySpend(ctx.from.id);
-  if (smartDailyLimit > 0) {
-    let usageRatio = todaySpend / smartDailyLimit;
-    if (usageRatio > 1.0) score -= 30;
-    else if (usageRatio > 0.8) score -= 15;
-    else if (usageRatio > 0.6) score -= 5;
-  }
-  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
-  if (totalInitialBalance > 0) {
-    let balanceRatio = totalBalance / totalInitialBalance;
-    if (balanceRatio < 0.10) score -= 25;
-    else if (balanceRatio < 0.25) score -= 15;
-    else if (balanceRatio < 0.50) score -= 8;
-  }
-  const thisWeek = await getWeeklySpend(ctx.from.id, 0);
-  const lastWeek = await getWeeklySpend(ctx.from.id, 1);
-  if (lastWeek > 0) {
-    if (thisWeek > lastWeek * 1.3) score -= 25;
-    else if (thisWeek > lastWeek * 1.1) score -= 10;
-  }
   const thisMonthTxs = await getTransactionsForCurrentMonth(ctx.from.id);
   let monthIncome = 0;
   let monthSpend = 0;
@@ -447,16 +512,7 @@ async function handlePrediksi(ctx) {
   let savingRate = 0;
   if (monthIncome > 0) {
     savingRate = (monthIncome - monthSpend) / monthIncome;
-    if (savingRate < 0) score -= 20;
-    else if (savingRate < 0.1) score -= 10;
-    else if (savingRate > 0.3) score += 5;
   }
-  score = Math.max(0, Math.min(100, score));
-
-  let scoreEmoji = "🔴";
-  if (score >= 90) scoreEmoji = "💚";
-  else if (score >= 70) scoreEmoji = "🟡";
-  else if (score >= 50) scoreEmoji = "🟠";
 
   let advice = "Catat setiap transaksi untuk analisis yang lebih akurat.";
   if (score < 50) advice = "Kondisi keuanganmu kritis. Tunda pengeluaran non-esensial.";
@@ -471,7 +527,7 @@ async function handlePrediksi(ctx) {
   text += `💸 Rata\\-rata harian: *${esc(formatRupiah(avg30))}*\n`;
   text += `📈 Tren: *${esc(trendStr)}* ${esc(trendEmoji)}\n\n`;
 
-  text += `📅 Estimasi saldo habis:\n*${esc(formatDate(predictedDate.toISOString().split('T')[0]))}* \\(${esc(daysUntilEmpty.toString())} hari lagi\\)\n\n`;
+  text += `📅 Estimasi saldo habis:\n*${esc(predictedDate.toLocaleDateString("id-ID", { day: "2-digit", month: "long", year: "numeric" }))}* \\(${esc(daysUntilEmpty.toString())} hari lagi\\)\n\n`;
 
   text += `🏆 *Top 3 Pengeluaran Bulan Ini:*\n`;
   for (let i = 0; i < Math.min(3, sortedCats.length); i++) {
@@ -519,30 +575,12 @@ async function generateReport(ctx, isMonthly) {
   const title = isMonthly ? "Bulan" : "Minggu";
   const savingRate = totalIn > 0 ? ((totalIn - totalOut) / totalIn) : 0;
 
-  // Calculate Score for Report
-  let score = 100;
+  // Calculate Score for Report using shared function
   const smartDailyLimit = await calculateSmartLimit(telegramId);
-  const todaySpend = await getDailySpend(telegramId);
-  if (smartDailyLimit > 0) {
-    let usageRatio = todaySpend / smartDailyLimit;
-    if (usageRatio > 1.0) score -= 30; else if (usageRatio > 0.8) score -= 15; else if (usageRatio > 0.6) score -= 5;
-  }
-  const accounts = await getAccounts(telegramId);
-  const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
-  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
-  if (totalInitialBalance > 0) {
-    let balanceRatio = totalBalance / totalInitialBalance;
-    if (balanceRatio < 0.10) score -= 25; else if (balanceRatio < 0.25) score -= 15; else if (balanceRatio < 0.50) score -= 8;
-  }
-  const thisWeek = await getWeeklySpend(telegramId, 0);
-  const lastWeek = await getWeeklySpend(telegramId, 1);
-  if (lastWeek > 0) {
-    if (thisWeek > lastWeek * 1.3) score -= 25; else if (thisWeek > lastWeek * 1.1) score -= 10;
-  }
-  if (savingRate < 0) score -= 20; else if (savingRate < 0.1) score -= 10; else if (savingRate > 0.3) score += 5;
-  score = Math.max(0, Math.min(100, score));
+  const scorecard = await calculateScore(telegramId, smartDailyLimit);
+  const { score } = scorecard;
 
-  // Period Advice based on Savings
+  // Period Advice based on Savings from report period
   let msgAdvice = "Coba simpan uangmu lebih baik lagi periode depan.";
   if (savingRate > 0.3) msgAdvice = "Pengelolaan uang yang sangat baik! Lanjutkan di periode berikutnya.";
   else if (savingRate > 0.1) msgAdvice = "Cukup baik, tapi kamu masih bisa lebih efisien!";
@@ -634,6 +672,12 @@ async function sendCatatPreview(ctx, sess) {
 
 // ── CALLBACK QUERY HANDLER ────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
+  // Security: Rate limiting
+  if (isRateLimited(ctx.from.id)) {
+    await ctx.answerCallbackQuery("⏳ Terlalu cepat, tunggu sebentar.");
+    return;
+  }
+
   const data = ctx.callbackQuery.data;
   const chatId = ctx.chat.id;
   const sess = getSession(chatId);
@@ -645,15 +689,20 @@ bot.on("callback_query:data", async (ctx) => {
       await ctx.deleteMessage().catch(() => { });
     } else {
       await ctx.editMessageText("❌ Transaksi dibatalkan\\.", { parse_mode: "MarkdownV2" });
-      await ctx.reply("Gunakan menu di bawah untuk akses cepat 👇");
     }
     return;
   }
 
   if (data.startsWith("menu_")) {
-    await ctx.answerCallbackQuery();
     try { await ctx.deleteMessage(); } catch (e) { }
 
+    if (data === "menu_start") {
+      const name = ctx.from.first_name || "Pengguna";
+      return ctx.reply(
+        `👋 *Halo, ${esc(name)}\\!*\n\nSelamat datang di *MyDuit Ku* 💰\n\nPilih menu di bawah ini:`,
+        { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
+      );
+    }
     if (data === "menu_saldo") return handleSaldo(ctx);
     if (data === "menu_catat") return handleCatat(ctx);
     if (data === "menu_riwayat") return handleRiwayat(ctx);
@@ -679,7 +728,9 @@ bot.on("callback_query:data", async (ctx) => {
     const acc = await getAccountById(accId, ctx.from.id);
     if (!acc) return ctx.editMessageText("⚠️ Rekening tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
     await deleteAccount(accId, ctx.from.id);
-    return ctx.editMessageText(`✅ Rekening *${esc(acc.bank_name)}* berhasil dihapus\\.`, { parse_mode: "MarkdownV2" });
+    const kb = new InlineKeyboard()
+      .text("🏠 Menu Utama", "menu_start");
+    return ctx.editMessageText(`✅ Rekening *${esc(acc.bank_name)}* berhasil dihapus\\.`, { parse_mode: "MarkdownV2", reply_markup: kb });
   }
 
   if (data.startsWith("catat_akun_")) {
@@ -782,7 +833,6 @@ bot.on("callback_query:data", async (ctx) => {
     const msg = `✅ *Transaksi Berhasil Dicatat\\!*\n──────────────────\n🏦 *${esc(acc.bank_name)}*\n${esc(icon)} ${esc(labelKategori)} — ${esc(formatRupiah(sess.amount))}\n${sess.note ? `📝 _${esc(sess.note)}_\n\n` : "\n"}💰 Saldo terkini: *${esc(formatRupiah(acc.balance))}*`;
 
     await ctx.editMessageText(msg, { parse_mode: "MarkdownV2" });
-    await ctx.reply("Gunakan menu di bawah ini 👇");
 
     return analyzeAndAlert(ctx, ctx.from.id);
   }
@@ -790,10 +840,31 @@ bot.on("callback_query:data", async (ctx) => {
 
 // ── TEXT MESSAGE HANDLER ──────────────────────────────────────
 bot.on("message:text", async (ctx) => {
+  // Security: Rate limiting
+  if (isRateLimited(ctx.from.id)) return;
+
   const chatId = ctx.chat.id;
   const text = ctx.message.text.trim();
   const sess = getSession(chatId);
 
+  // Security: Input length validation
+  const MAX_LENGTHS = {
+    tambahbank_nama:       50,
+    tambahbank_saldo:      20,
+    tambahkategori_nama:   30,
+    setlimit_nominal:      20,
+    catat_input_kategori:  30,
+    catat_nominal:         20,
+    catat_keterangan:     100,
+  };
+
+  const maxLen = MAX_LENGTHS[sess.step];
+  if (maxLen && text.length > maxLen) {
+    return ctx.reply(
+      `⚠️ Terlalu panjang\\. Maksimal ${maxLen} karakter\\.`,
+      { parse_mode: "MarkdownV2" }
+    );
+  }
 
   if (sess.step === "tambahbank_nama") {
     sess.bankName = text;
@@ -853,10 +924,19 @@ bot.on("message:text", async (ctx) => {
 
 // ── VERCEL HANDLER ────────────────────────────────────────────
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(200).json({ status: "MyDuit Ku Bot is running 💰" });
+  if (req.method !== "POST") {
+    return res.status(200).json({ status: "MyDuit Ku Bot is running 💰" });
+  }
+
+  // Security: Validate request is from Telegram
+  const secret = req.headers["x-telegram-bot-api-secret-token"];
+  if (process.env.WEBHOOK_SECRET && secret !== process.env.WEBHOOK_SECRET) {
+    console.warn("Unauthorized webhook request blocked");
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
   try {
-    await initDB();
-    await bot.init();
+    await ensureDB();
     await bot.handleUpdate(req.body);
     res.status(200).json({ ok: true });
   } catch (err) {
