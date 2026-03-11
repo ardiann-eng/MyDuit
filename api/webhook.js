@@ -1,5 +1,5 @@
 // api/webhook.js
-import { Bot, InlineKeyboard, Keyboard } from "grammy";
+import { Bot, InlineKeyboard, Keyboard, session } from "grammy";
 import {
   initDB, upsertUser, addAccount, getAccounts,
   getAccountById, deleteAccount, addTransaction,
@@ -41,8 +41,8 @@ const defaultIncomeSources = [
 const mainMenuKeyboard = new Keyboard()
   .text("💰 Saldo").text("📝 Catat").row()
   .text("📋 Riwayat").text("🔮 Prediksi").row()
-  .text("🏦 Tambah Bank").text("📊 Laporan").row()
-  .text("⚙️ Pengaturan")
+  .text("📊 Laporan").text("🏦 Tambah Bank").row()
+  .text("🗑 Hapus Bank")
   .resized()
   .persistent();
 
@@ -299,7 +299,7 @@ bot.command("start", async (ctx) => {
   await ctx.reply("Gunakan menu di bawah untuk akses cepat 👇", { reply_markup: mainMenuKeyboard });
 });
 
-bot.command("saldo", async (ctx) => {
+async function handleSaldo(ctx) {
   clearSession(ctx.chat.id);
   const accounts = await getAccounts(ctx.from.id);
   if (accounts.length === 0) return ctx.reply(`💳 Belum ada rekening tercatat\\.\n\nGunakan /tambahbank untuk menambahkan rekening pertamamu\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
@@ -313,9 +313,9 @@ bot.command("saldo", async (ctx) => {
   }
   text += `─────────────────────\n📊 *Total Semua Rekening*\n*${esc(formatRupiah(total))}*`;
   await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
-});
+}
 
-bot.command("riwayat", async (ctx) => {
+async function handleRiwayat(ctx) {
   clearSession(ctx.chat.id);
   const txs = await getRecentTransactions(ctx.from.id, 10);
   if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
@@ -332,9 +332,9 @@ bot.command("riwayat", async (ctx) => {
     text += `\n   🕐 ${esc(formatDate(tx.created_at))}\n\n`;
   }
   await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
-});
+}
 
-bot.command("hapusbank", async (ctx) => {
+async function handleHapusBank(ctx) {
   clearSession(ctx.chat.id);
   const accounts = await getAccounts(ctx.from.id);
   if (accounts.length === 0) return ctx.reply(`⚠️ Tidak ada rekening untuk dihapus\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
@@ -345,13 +345,13 @@ bot.command("hapusbank", async (ctx) => {
   }
   keyboard.text("❌ Batal", "batal");
   await ctx.reply(`🗑 *Hapus Rekening*\n\n⚠️ Semua transaksi di rekening tersebut juga akan terhapus\\.\n\nPilih rekening yang ingin dihapus:`, { parse_mode: "MarkdownV2", reply_markup: keyboard });
-});
+}
 
-bot.command("tambahbank", async (ctx) => {
+async function handleTambahBank(ctx) {
   clearSession(ctx.chat.id);
   getSession(ctx.chat.id).step = "tambahbank_nama";
   await ctx.reply(`🏦 *Tambah Rekening Baru*\n\nKetik nama bank atau dompet digitalmu\\.\n_Contoh: BCA, Mandiri, GoPay, Dana_`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
-});
+}
 
 bot.command("tambahkategori", async (ctx) => {
   clearSession(ctx.chat.id);
@@ -370,7 +370,7 @@ bot.command("settings", async (ctx) => {
   await ctx.reply(`⚙️ *Pengaturan MyDuit*\n\nPilih opsi yang ingin diatur:`, { parse_mode: "MarkdownV2", reply_markup: pengaturanKeyboard });
 });
 
-bot.command("prediksi", async (ctx) => {
+async function handlePrediksi(ctx) {
   clearSession(ctx.chat.id);
   const txs = await getTransactionsByDateRange(ctx.from.id, 'keluar', 30);
   if (txs.length === 0) return ctx.reply(`🔮 Belum ada data pengeluaran 30 hari terakhir\\.`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
@@ -485,7 +485,7 @@ bot.command("prediksi", async (ctx) => {
   text += `💡 _${esc(advice)}_`;
 
   await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
-});
+}
 
 async function generateReport(ctx, isMonthly) {
   clearSession(ctx.chat.id);
@@ -573,11 +573,31 @@ async function generateReport(ctx, isMonthly) {
   await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
 }
 
+// ── COMMAND BINDINGS ──────────────────────────────────────────
+bot.command("saldo", handleSaldo);
+bot.hears("💰 Saldo", handleSaldo);
+
+bot.command("catat", handleCatat);
+bot.hears("📝 Catat", handleCatat);
+
+bot.command("riwayat", handleRiwayat);
+bot.hears("📋 Riwayat", handleRiwayat);
+
+bot.command("prediksi", handlePrediksi);
+bot.hears("🔮 Prediksi", handlePrediksi);
+
 bot.command("laporanminggu", (ctx) => generateReport(ctx, false));
 bot.command("laporanbulan", (ctx) => generateReport(ctx, true));
+bot.hears("📊 Laporan", (ctx) => generateReport(ctx, true));
+
+bot.command("tambahbank", handleTambahBank);
+bot.hears("🏦 Tambah Bank", handleTambahBank);
+
+bot.command("hapusbank", handleHapusBank);
+bot.hears("🗑 Hapus Bank", handleHapusBank);
 
 // ── CATAT ──────────────────────────────────────────────────
-bot.command("catat", async (ctx) => {
+async function handleCatat(ctx) {
   clearSession(ctx.chat.id);
   const accounts = await getAccounts(ctx.from.id);
   if (accounts.length === 0) return ctx.reply(`⚠️ Belum ada rekening\\. Tambah dulu dengan /tambahbank`, { parse_mode: "MarkdownV2", reply_markup: mainMenuKeyboard });
@@ -587,7 +607,7 @@ bot.command("catat", async (ctx) => {
 
   getSession(ctx.chat.id).step = "catat_pilih_akun";
   await ctx.reply(`📝 *Catat Transaksi*\n\nPilih rekening:`, { parse_mode: "MarkdownV2", reply_markup: keyboard });
-});
+}
 
 // ── CALLBACK QUERY HANDLER ────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
@@ -672,13 +692,6 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   const sess = getSession(chatId);
 
-  if (text === "💰 Saldo") return bot.api.sendMessage(chatId, "/saldo");
-  if (text === "📝 Catat") return bot.api.sendMessage(chatId, "/catat");
-  if (text === "📋 Riwayat") return bot.api.sendMessage(chatId, "/riwayat");
-  if (text === "🔮 Prediksi") return bot.api.sendMessage(chatId, "/prediksi");
-  if (text === "🏦 Tambah Bank") return bot.api.sendMessage(chatId, "/tambahbank");
-  if (text === "📊 Laporan") return bot.api.sendMessage(chatId, "/laporanbulan");
-  if (text === "⚙️ Pengaturan") return bot.api.sendMessage(chatId, "/settings");
 
   if (sess.step === "tambahbank_nama") {
     sess.bankName = text;
