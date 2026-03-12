@@ -126,83 +126,150 @@ function isValidNominal(val) {
 
 // ── SCORE CALCULATION ──────────────────────────────────────────
 async function calculateScore(telegramId, dailyLimit, prefetchedData = null) {
-  let score = 100;
+  try {
+    let score = 50; // Base score starts at 50
 
-  // Use prefetched data if available, otherwise fetch from DB
-  let todaySpend, accounts, thisMonthTxs;
-  if (prefetchedData) {
-    todaySpend = prefetchedData.todaySpend;
-    accounts = prefetchedData.accounts;
-    thisMonthTxs = prefetchedData.thisMonthTxs;
-  } else {
-    const [spend, accts, txs] = await Promise.all([
-      getDailySpend(telegramId),
-      getAccounts(telegramId),
-      getTransactionsForCurrentMonth(telegramId),
-    ]);
-    todaySpend = spend;
-    accounts = accts;
-    thisMonthTxs = txs;
+    // Fetch user settings for Factor 1
+    const settings = await getUserSettings(telegramId);
+
+    // Use prefetched data if available, otherwise fetch from DB
+    let todaySpend, accounts, thisMonthTxs, thisWeek, lastWeek;
+    if (prefetchedData) {
+      todaySpend = prefetchedData.todaySpend;
+      accounts = prefetchedData.accounts;
+      thisMonthTxs = prefetchedData.thisMonthTxs;
+      thisWeek = prefetchedData.thisWeek;
+      lastWeek = prefetchedData.lastWeek;
+    } else {
+      const [spend, accts, txs, tw, lw] = await Promise.all([
+        getDailySpend(telegramId),
+        getAccounts(telegramId),
+        getTransactionsForCurrentMonth(telegramId),
+        getWeeklySpend(telegramId, 0),
+        getWeeklySpend(telegramId, 1),
+      ]);
+      todaySpend = spend;
+      accounts = accts;
+      thisMonthTxs = txs;
+      thisWeek = tw;
+      lastWeek = lw;
+    }
+
+    const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
+    const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
+
+    // ── FACTOR 1: Daily Limit Usage (range: -15 to +20) ──
+    let factor1 = 0;
+    let usageRatio = 0;
+
+    let limitReference = 0;
+    // Check for manual limit
+    if (settings?.limit_mode === 'custom' && settings?.daily_limit > 0) {
+      limitReference = settings.daily_limit;
+    } else if (!prefetchedData) {
+      // Calculate from weekly spend if not prefetched
+      const weekSpend = await getWeeklySpend(telegramId, 0);
+      limitReference = weekSpend > 0 ? weekSpend / 7 : 0;
+    } else if (prefetchedData?.thisWeek) {
+      limitReference = prefetchedData.thisWeek / 7;
+    }
+
+    if (limitReference > 0) {
+      usageRatio = todaySpend / limitReference;
+      if (todaySpend < limitReference * 0.5) factor1 = 20;
+      else if (todaySpend < limitReference * 0.8) factor1 = 10;
+      else if (todaySpend <= limitReference) factor1 = 0;
+      else factor1 = -15;
+    }
+
+    score += factor1;
+
+    // ── FACTOR 2: Balance Health (range: -20 to +15) ──
+    let factor2 = 0;
+    let balanceRatio = 1.0;
+
+    if (totalInitialBalance > 0) {
+      balanceRatio = totalBalance / totalInitialBalance;
+      if (balanceRatio > 0.75) factor2 = 15;
+      else if (balanceRatio >= 0.5) factor2 = 10;
+      else if (balanceRatio >= 0.25) factor2 = 0;
+      else if (balanceRatio >= 0.1) factor2 = -10;
+      else factor2 = -20;
+    }
+
+    score += factor2;
+
+    // ── FACTOR 3: Weekly Trend (range: -15 to +10) ──
+    let factor3 = 0;
+
+    if (lastWeek > 0) {
+      if (thisWeek < lastWeek * 0.9) factor3 = 10;
+      else if (thisWeek <= lastWeek * 1.1) factor3 = 5;
+      else if (thisWeek <= lastWeek * 1.3) factor3 = -5;
+      else factor3 = -15;
+    }
+
+    score += factor3;
+
+    // ── FACTOR 4: Saving Rate (range: -20 to +15) ──
+    let factor4 = 0;
+    let savingRate = 0;
+
+    // Merge transactions from current month and last 30 days
+    const txList = thisMonthTxs ? [...thisMonthTxs] : [];
+    const txsLast30 = await getTransactionsByDateRange(telegramId, 'all', 30);
+    
+    // Merge and deduplicate by id
+    const seenIds = new Set();
+    const allTxs = [];
+    for (const tx of txList) {
+      seenIds.add(tx.id);
+      allTxs.push(tx);
+    }
+    for (const tx of txsLast30) {
+      if (!seenIds.has(tx.id)) {
+        allTxs.push(tx);
+      }
+    }
+
+    // Count distinct dates
+    const distinctDates = new Set();
+    let totalIncome30 = 0;
+    let totalSpend30 = 0;
+    for (const tx of allTxs) {
+      // Extract date portion from created_at
+      const dateStr = tx.created_at ? tx.created_at.split(' ')[0] : '';
+      if (dateStr) distinctDates.add(dateStr);
+
+      if (tx.type === 'masuk') totalIncome30 += tx.amount;
+      else if (tx.type === 'keluar') totalSpend30 += tx.amount;
+    }
+
+    // Check if sufficient data (7+ days worth)
+    if (distinctDates.size >= 7 && totalIncome30 > 0) {
+      savingRate = (totalIncome30 - totalSpend30) / totalIncome30;
+      if (savingRate > 0.3) factor4 = 15;
+      else if (savingRate >= 0.1) factor4 = 10;
+      else if (savingRate >= 0) factor4 = 0;
+      else factor4 = -20; // spending > income
+    }
+
+    score += factor4;
+
+    // ── CLAMP SCORE ──
+    score = Math.max(0, Math.min(100, score));
+
+    // ── EMOJI MAPPING ──
+    let scoreEmoji = "🔴 Kritis";
+    if (score >= 85) scoreEmoji = "💚 Sangat Sehat";
+    else if (score >= 70) scoreEmoji = "🟡 Cukup Baik";
+    else if (score >= 50) scoreEmoji = "🟠 Perlu Perhatian";
+
+    return { score, scoreEmoji, savingRate, usageRatio, balanceRatio };
+  } catch (err) {
+    console.error("calculateScore error:", err);
+    return { score: 50, scoreEmoji: "🟠 Perlu Perhatian", savingRate: 0, usageRatio: 0, balanceRatio: 1 };
   }
-  
-  const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
-  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
-
-  // Factor 1: Daily Limit Usage (30pts)
-  let usageRatio = 0;
-  if (dailyLimit > 0) {
-    usageRatio = todaySpend / dailyLimit;
-    if (usageRatio > 1.0) score -= 30;
-    else if (usageRatio > 0.8) score -= 15;
-    else if (usageRatio > 0.6) score -= 5;
-  }
-
-  // Factor 2: Balance Health (25pts)
-  let balanceRatio = 1.0;
-  if (totalInitialBalance > 0) {
-    balanceRatio = totalBalance / totalInitialBalance;
-    if (balanceRatio < 0.10) score -= 25;
-    else if (balanceRatio < 0.25) score -= 15;
-    else if (balanceRatio < 0.50) score -= 8;
-  }
-
-  // Factor 3: Weekly Trend (25pts)
-  const [thisWeek, lastWeek] = prefetchedData ? [prefetchedData.thisWeek, prefetchedData.lastWeek] : 
-    await Promise.all([
-      getWeeklySpend(telegramId, 0),
-      getWeeklySpend(telegramId, 1),
-    ]);
-  if (lastWeek > 0) {
-    if (thisWeek > lastWeek * 1.3) score -= 25;
-    else if (thisWeek > lastWeek * 1.1) score -= 10;
-  }
-
-  // Factor 4: Saving Behavior (20pts)
-  if (!thisMonthTxs) thisMonthTxs = await getTransactionsForCurrentMonth(telegramId);
-  let monthIncome = 0;
-  let monthSpend = 0;
-  for (const tx of thisMonthTxs) {
-    if (tx.type === "masuk") monthIncome += tx.amount;
-    else monthSpend += tx.amount;
-  }
-  let savingRate = 0;
-  if (monthIncome > 0) {
-    savingRate = (monthIncome - monthSpend) / monthIncome;
-    if (savingRate < 0) score -= 20;
-    else if (savingRate < 0.1) score -= 10;
-    else if (savingRate > 0.3) score += 5;
-  }
-
-  // Clamp score
-  score = Math.max(0, Math.min(100, score));
-
-  // Emoji Mapping
-  let scoreEmoji = "🔴 Kritis";
-  if (score >= 90) scoreEmoji = "💚 Sangat Sehat";
-  else if (score >= 70) scoreEmoji = "🟡 Cukup Baik";
-  else if (score >= 50) scoreEmoji = "🟠 Perlu Perhatian";
-
-  return { score, scoreEmoji, savingRate, usageRatio, balanceRatio };
 }
 
 // ── ML SMART LIMIT ─────────────────────────────────────────────
