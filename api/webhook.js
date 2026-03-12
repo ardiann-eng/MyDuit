@@ -487,19 +487,65 @@ async function handleRiwayat(ctx) {
   const txs = await getRecentTransactions(ctx.from.id, 10);
   if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2" });
 
-  let text = `📋 *10 Transaksi Terakhir*\n─────────────────────\n`;
+  // Fetch data in parallel for footer
+  const [accounts, dailyLimit, todaySpend] = await Promise.all([
+    getAccounts(ctx.from.id),
+    calculateSmartLimit(ctx.from.id),
+    getDailySpend(ctx.from.id),
+  ]);
+
+  const totalSaldo = accounts.reduce((sum, a) => sum + a.balance, 0);
+
+  // Build transaction list with date grouping
+  let text = `📋 *10 Transaksi Terakhir*\n──────────────────────\n\n`;
+  let lastDate = null;
+
   for (const tx of txs) {
+    const dateStrRaw = tx.created_at.split(' ')[0]; // "YYYY-MM-DD"
+    
+    // Show date header if date changed
+    if (dateStrRaw !== lastDate) {
+      const dateObj = new Date(dateStrRaw + 'T00:00:00');
+      const dateLabel = dateObj.toLocaleDateString('id-ID', { 
+        day: '2-digit', month: 'short', year: 'numeric' 
+      });
+      text += `*📅 ${esc(dateLabel)}*\n`;
+      lastDate = dateStrRaw;
+    }
+
+    // Transaction format
     const icon = tx.type === "masuk" ? "⬆️" : "⬇️";
     const sign = tx.type === "masuk" ? "\\+" : "\\-";
-    const label = tx.type === "masuk" ? tx.source || "" : tx.category || "";
-
-    const txDate = new Date(tx.created_at.replace(' ', 'T'));
-    const dateStr = txDate.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
-    text += `${icon} ${sign}${esc(formatRupiah(tx.amount))}\n`;
-    text += `   📂 ${esc(tx.bank_name)} ` + (label ? `\\- ${esc(label)}` : "");
+    const label = tx.type === "masuk" ? (tx.source || "Lainnya") : (tx.category || "Lainnya");
+    
+    text += `${icon} ${sign}${esc(formatRupiah(tx.amount))} • ${esc(label)}\n`;
+    text += `🏦 ${esc(tx.bank_name)}`;
     if (tx.note) text += ` • _${esc(tx.note)}_`;
-    text += `\n   ${esc(dateStr)}\n\n`;
+    text += `\n\n`;
   }
+
+  // Remove trailing blank line before footer
+  text = text.trimEnd() + '\n\n';
+
+  // Footer section: Progress bar and spending info
+  const filled = dailyLimit > 0 
+    ? Math.min(10, Math.round((todaySpend / dailyLimit) * 10)) 
+    : 0;
+  const barStr = '█'.repeat(filled) + '░'.repeat(10 - filled);
+  const pct = dailyLimit > 0 
+    ? Math.min(999, Math.round((todaySpend / dailyLimit) * 100)) 
+    : 0;
+
+  const limitDisplay = dailyLimit > 0 
+    ? formatRupiah(Math.round(dailyLimit))
+    : "Belum diatur";
+
+  text += `──────────────────────\n`;
+  text += `📊 *Pengeluaran Hari Ini*\n`;
+  text += `\`${esc(barStr)}\` ${esc(pct.toString())}\\% dari limit harian\n`;
+  text += `💸 ${esc(formatRupiah(todaySpend))} / ${esc(limitDisplay)}\n`;
+  text += `🏦 Sisa Saldo: *${esc(formatRupiah(totalSaldo))}*`;
+
   await ctx.reply(text, { parse_mode: "MarkdownV2" });
 }
 
