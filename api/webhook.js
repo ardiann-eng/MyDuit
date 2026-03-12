@@ -129,8 +129,10 @@ async function calculateScore(telegramId, dailyLimit, prefetchedData = null) {
   try {
     let score = 50; // Base score starts at 50
 
-    // Fetch user settings for Factor 1
-    const settings = await getUserSettings(telegramId);
+    // Fetch user settings for Factor 1 (use prefetched if available)
+    const settings = prefetchedData?.settings
+      ? prefetchedData.settings
+      : await getUserSettings(telegramId);
 
     // Use prefetched data if available, otherwise fetch from DB
     let todaySpend, accounts, thisMonthTxs, thisWeek, lastWeek;
@@ -278,6 +280,22 @@ async function calculateScore(telegramId, dailyLimit, prefetchedData = null) {
   }
 }
 
+// ── PURE LIMIT CALCULATOR (no DB calls) ───────────────────────
+// Hitung limit dari data yang sudah di-fetch, tanpa DB call tambahan
+function computeLimitFromData(settings, accounts) {
+  if (settings?.limit_mode === 'custom' && settings?.daily_limit > 0) {
+    return settings.daily_limit;
+  }
+  const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
+  let dailyLimit = totalBalance * 0.20;
+  if (settings?.monthly_income > 0) {
+    const incomeBasedLimit = (settings.monthly_income * 0.70) / 30;
+    dailyLimit = Math.min(dailyLimit, incomeBasedLimit);
+  }
+  if (dailyLimit < 10000) dailyLimit = 10000;
+  return Math.round(dailyLimit / 100) * 100;
+}
+
 // ── ML SMART LIMIT ─────────────────────────────────────────────
 async function calculateSmartLimit(telegramId) {
   const settings = await getUserSettings(telegramId);
@@ -422,31 +440,48 @@ bot.command("start", async (ctx) => {
   ]);
 
   try {
-    // Single parallel fetch for ALL data needed
-    const [accounts, dailyLimit, todaySpend, thisWeek, lastWeek, thisMonthTxs] =
-      await Promise.all([
-        getAccounts(ctx.from.id),
-        calculateSmartLimit(ctx.from.id),
-        getDailySpend(ctx.from.id),
-        getWeeklySpend(ctx.from.id, 0),
-        getWeeklySpend(ctx.from.id, 1),
-        getTransactionsForCurrentMonth(ctx.from.id),
-      ]);
+    // Step 2: SATU Promise.all untuk SEMUA data yang dibutuhkan
+    // Termasuk settings — sehingga calculateSmartLimit tidak perlu dipanggil
+    const [
+      accounts,
+      settings,
+      todaySpend,
+      thisWeek,
+      lastWeek,
+      thisMonthTxs,
+    ] = await Promise.all([
+      getAccounts(ctx.from.id),
+      getUserSettings(ctx.from.id),
+      getDailySpend(ctx.from.id),
+      getWeeklySpend(ctx.from.id, 0),
+      getWeeklySpend(ctx.from.id, 1),
+      getTransactionsForCurrentMonth(ctx.from.id),
+    ]);
 
-    // Build prefetched data object to avoid redundant DB calls in calculateScore
+    // Hitung limit dari data yang sudah ada — ZERO DB calls tambahan
+    const dailyLimit = computeLimitFromData(settings, accounts);
+
+    // Simpan limit ke DB tanpa menunggu (fire and forget)
+    updateSmartLimit(ctx.from.id, dailyLimit).catch(err =>
+      console.error("updateSmartLimit error:", err)
+    );
+
+    // Build prefetchedData — sertakan settings agar calculateScore
+    // tidak fetch getUserSettings lagi di dalamnya
     const prefetchedData = {
       todaySpend,
       accounts,
       thisMonthTxs,
       thisWeek,
       lastWeek,
+      settings,
     };
 
-    // Pass prefetchedData so calculateScore skips internal DB calls
+    // calculateScore tidak akan fetch DB lagi karena prefetchedData lengkap
     const scorecard = await calculateScore(ctx.from.id, dailyLimit, prefetchedData);
     const { score, scoreEmoji } = scorecard;
 
-    // Calculate total saldo from already-fetched accounts
+    // Hitung total saldo dari data yang sudah ada
     const totalSaldo = accounts.reduce((sum, acc) => sum + acc.balance, 0);
 
     // --- DYNAMIC TIP (score-based, max 1 line) ---
@@ -464,7 +499,6 @@ bot.command("start", async (ctx) => {
     }
 
     // --- FORMAT MESSAGE ---
-    // Case 1: user has accounts
     let text;
     if (accounts.length > 0) {
       text =
@@ -475,7 +509,6 @@ bot.command("start", async (ctx) => {
         `💡 _${tip}_\n\n` +
         `Mau ngapain hari ini\\?`;
     } else {
-      // Case 2: user has no accounts yet
       text =
         `👋 Hai, *${esc(name)}\\!*\n` +
         `Yuk cek kondisi keuanganmu hari ini\\! 🔍\n\n` +
