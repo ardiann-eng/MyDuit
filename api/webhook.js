@@ -420,46 +420,76 @@ bot.command("start", async (ctx) => {
     .catch(() => { });
 
   try {
-    // Fetch data in parallel
-    const [accounts, dailyLimit, todaySpend] = await Promise.all([
-      getAccounts(ctx.from.id),
-      calculateSmartLimit(ctx.from.id),
-      getDailySpend(ctx.from.id)
-    ]);
+    // Single parallel fetch for ALL data needed
+    const [accounts, dailyLimit, todaySpend, thisWeek, lastWeek, thisMonthTxs] =
+      await Promise.all([
+        getAccounts(ctx.from.id),
+        calculateSmartLimit(ctx.from.id),
+        getDailySpend(ctx.from.id),
+        getWeeklySpend(ctx.from.id, 0),
+        getWeeklySpend(ctx.from.id, 1),
+        getTransactionsForCurrentMonth(ctx.from.id),
+      ]);
 
-    // Get score with dailyLimit parameter
-    const scorecard = await calculateScore(ctx.from.id, dailyLimit);
-    const score = scorecard.score;
+    // Build prefetched data object to avoid redundant DB calls in calculateScore
+    const prefetchedData = {
+      todaySpend,
+      accounts,
+      thisMonthTxs,
+      thisWeek,
+      lastWeek,
+    };
 
-    // Calculate total saldo
-    let totalSaldo = 0;
-    for (const acc of accounts) {
-      totalSaldo += acc.balance;
+    // Pass prefetchedData so calculateScore skips internal DB calls
+    const scorecard = await calculateScore(ctx.from.id, dailyLimit, prefetchedData);
+    const { score, scoreEmoji } = scorecard;
+
+    // Calculate total saldo from already-fetched accounts
+    const totalSaldo = accounts.reduce((sum, acc) => sum + acc.balance, 0);
+
+    // --- DYNAMIC TIP (score-based, max 1 line) ---
+    let tip;
+    if (accounts.length === 0) {
+      tip = "Tambah rekening pertamamu biar bisa mulai tracking\\!";
+    } else if (score >= 85) {
+      tip = "Keuanganmu sehat banget hari ini, pertahankan\\! 🔥";
+    } else if (score >= 70) {
+      tip = "Hampir sempurna\\! Terus jaga pengeluaranmu ya\\.";
+    } else if (score >= 50) {
+      tip = "Mulai waspada, cek kategori pengeluaran terbesarmu\\!";
+    } else {
+      tip = "Kondisi kritis\\! Kurangi pengeluaran non\\-esensial sekarang\\.  🚨";
     }
 
-    // Determine score emoji
-    let scoreEmoji = "🔴";
-    if (score >= 80) scoreEmoji = "🟢";
-    else if (score >= 60) scoreEmoji = "🟡";
-
-    // Generate dynamic tip
-    let tip = "Catat setiap transaksi untuk analisis yang lebih baik\\!";
-    if (score < 50) tip = "Kondisi keuanganmu kritis\\! Prioritaskan kebutuhan pokok\\.";
-    else if (totalSaldo < 500000) tip = "Saldo sedang mepet\\. Hemat pengeluaran untuk bulan depan\\.";
-    else if (todaySpend > totalSaldo * 0.05) tip = "Pengeluaran hari ini lumayan\\. Pertimbangkan rencana belanja selanjutnya\\.";
-    else if (score >= 80) tip = "Mantap\\! Keuanganmu sehat hari ini\\.";
-
-    const text = `👋 Halo, ${esc(name)}\\! Welcome back to MyDuit Ku 💰\n` +
-      `💵 Total Saldo: ${esc(formatRupiah(totalSaldo))}\n` +
-      `🎯 Skor Kesehatan: ${esc(score.toString())}/100 ${esc(scoreEmoji)}\n` +
-      `📌 Tips Hari Ini: ${tip}\n\n` +
-      `Yuk mulai cek atau catat transaksi baru\\! 👇`;
+    // --- FORMAT MESSAGE ---
+    // Case 1: user has accounts
+    let text;
+    if (accounts.length > 0) {
+      text =
+        `👋 Hai, *${esc(name)}\\!*\n` +
+        `Yuk cek kondisi keuanganmu hari ini\\! 🔍\n\n` +
+        `💰 Total Saldo: *${esc(formatRupiah(totalSaldo))}*\n` +
+        `🎯 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n` +
+        `💡 _${tip}_\n\n` +
+        `Mau ngapain hari ini\\?`;
+    } else {
+      // Case 2: user has no accounts yet
+      text =
+        `👋 Hai, *${esc(name)}\\!*\n` +
+        `Yuk cek kondisi keuanganmu hari ini\\! 🔍\n\n` +
+        `💳 Belum ada rekening tercatat\n` +
+        `🎯 Skor Kesehatan: *0/100*\n` +
+        `💡 _${tip}_\n\n` +
+        `Mau ngapain hari ini\\?`;
+    }
 
     await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: startKeyboard });
+
   } catch (err) {
     console.error("Error in /start:", err);
     await ctx.reply(
-      `👋 Halo, ${esc(name)}\\! Welcome back to MyDuit Ku 💰\n\n` +
+      `👋 Hai, *${esc(name)}\\!*\n` +
+      `Yuk cek kondisi keuanganmu hari ini\\! 🔍\n\n` +
       `Yuk mulai cek atau catat transaksi baru\\! 👇`,
       { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
     );
