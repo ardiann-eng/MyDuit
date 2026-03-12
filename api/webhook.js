@@ -354,11 +354,15 @@ bot.command("start", async (ctx) => {
 
   try {
     // Fetch data in parallel
-    const [accounts, score, todaySpend] = await Promise.all([
+    const [accounts, dailyLimit, todaySpend] = await Promise.all([
       getAccounts(ctx.from.id),
-      calculateScore(ctx.from.id),
+      calculateSmartLimit(ctx.from.id),
       getTodaySpend(ctx.from.id)
     ]);
+
+    // Get score with dailyLimit parameter
+    const scorecard = await calculateScore(ctx.from.id, dailyLimit);
+    const score = scorecard.score;
 
     // Calculate total saldo
     let totalSaldo = 0;
