@@ -220,9 +220,9 @@ async function calculateScore(telegramId, dailyLimit, prefetchedData = null) {
     const txsLast30 = prefetchedData?.thisMonthTxs
       ? [] // skip if we already have monthly data from prefetch
       : await Promise.all([
-          getTransactionsByDateRange(telegramId, 'masuk', 30),
-          getTransactionsByDateRange(telegramId, 'keluar', 30),
-        ]).then(([masuk, keluar]) => [...masuk, ...keluar]);
+        getTransactionsByDateRange(telegramId, 'masuk', 30),
+        getTransactionsByDateRange(telegramId, 'keluar', 30),
+      ]).then(([masuk, keluar]) => [...masuk, ...keluar]);
 
     // Then merge with thisMonthTxs from prefetchedData or txList:
     const allTxsForSaving = [
@@ -342,7 +342,7 @@ async function analyzeAndAlert(ctx, telegramId) {
     const dailyLimit = computeLimitFromData(settings, accounts);
 
     // Simpan limit ke DB tanpa menunggu (fire and forget)
-    updateSmartLimit(telegramId, dailyLimit).catch(() => {});
+    updateSmartLimit(telegramId, dailyLimit).catch(() => { });
 
     // Build prefetchedData — sertakan settings agar calculateScore
     // tidak fetch getUserSettings lagi di dalamnya
@@ -562,6 +562,8 @@ async function handleRiwayat(ctx) {
     calculateSmartLimit(ctx.from.id),
     getDailySpend(ctx.from.id),
   ]);
+  const dailyLimit = computeLimitFromData(settings, accounts);
+  updateSmartLimit(ctx.from.id, dailyLimit).catch(() => { });
 
   const totalSaldo = accounts.reduce((sum, a) => sum + a.balance, 0);
 
@@ -694,15 +696,18 @@ async function handlePrediksi(ctx) {
   if (txs.length === 0) return ctx.reply(`🔮 Belum ada data pengeluaran 30 hari terakhir\\.`, { parse_mode: "MarkdownV2" });
 
   // Parallelize independent DB reads
-  const [smartDailyLimit, accounts, todaySpend, thisMonthTxs, thisWeek, lastWeek] =
+  const [accounts, settings, todaySpend, thisMonthTxs, thisWeek, lastWeek] =
     await Promise.all([
-      calculateSmartLimit(ctx.from.id),
       getAccounts(ctx.from.id),
+      getUserSettings(ctx.from.id),
       getDailySpend(ctx.from.id),
       getTransactionsForCurrentMonth(ctx.from.id),
       getWeeklySpend(ctx.from.id, 0),
       getWeeklySpend(ctx.from.id, 1),
     ]);
+
+  const smartDailyLimit = computeLimitFromData(settings, accounts);
+  updateSmartLimit(ctx.from.id, smartDailyLimit).catch(() => { });
 
   let total30 = 0, last7 = 0, prev7 = 0;
   const categoryMap = new Map();
@@ -848,7 +853,12 @@ async function generateReport(ctx, isMonthly) {
   const savingRate = totalIn > 0 ? ((totalIn - totalOut) / totalIn) : 0;
 
   // Calculate Score for Report using shared function
-  const smartDailyLimit = await calculateSmartLimit(telegramId);
+  const [reportAccounts, reportSettings] = await Promise.all([
+    getAccounts(telegramId),
+    getUserSettings(telegramId),
+  ]);
+  const smartDailyLimit = computeLimitFromData(reportSettings, reportAccounts);
+  updateSmartLimit(telegramId, smartDailyLimit).catch(() => { });
   const scorecard = await calculateScore(telegramId, smartDailyLimit);
   const { score } = scorecard;
 
