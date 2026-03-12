@@ -424,7 +424,7 @@ bot.command("start", async (ctx) => {
     const [accounts, dailyLimit, todaySpend] = await Promise.all([
       getAccounts(ctx.from.id),
       calculateSmartLimit(ctx.from.id),
-      getTodaySpend(ctx.from.id)
+      getDailySpend(ctx.from.id)
     ]);
 
     // Get score with dailyLimit parameter
