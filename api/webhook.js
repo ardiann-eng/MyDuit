@@ -41,6 +41,9 @@ const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN, {
   }
 });
 
+// Force Webhook Reply to eliminate network round-trip for ctx.reply
+bot.api.config.canUseWebhookReply = (method) => true;
+
 let dbInitialized = false;
 const initPromise = initDB()
   .then(() => { dbInitialized = true; })
