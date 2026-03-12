@@ -1,13 +1,8 @@
 {
   "version": 2,
+  "regions": ["sin1"],
   "crons": [
-    {
-      "path": "/api/cron",
-      "schedule": "0 13 * * *"
-    },
-    {
-      "path": "/api/cron",
-      "schedule": "0 1 1 * *"
-    }
+    { "path": "/api/cron", "schedule": "0 13 * * *" },
+    { "path": "/api/cron", "schedule": "0 1 1 * *" }
   ]
 }
