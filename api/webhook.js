@@ -46,7 +46,7 @@ const initPromise = initDB()
   .then(() => { dbInitialized = true; })
   .catch(err => console.error("DB init error:", err));
 
-const vercelCallback = webhookCallback(bot, "vercel");
+const vercelCallback = webhookCallback(bot, "http");
 
 // ── SECURITY: OPTIONAL PRIVATE BOT WHITELIST ──────────────────
 // Only apply if ALLOWED_USER_ID is set in env
