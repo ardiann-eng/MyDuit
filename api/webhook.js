@@ -1,16 +1,16 @@
 // api/webhook.js
-import { Bot, InlineKeyboard, session } from "grammy";
+import { Bot, InlineKeyboard } from "grammy";
 import {
   initDB, upsertUser, addAccount, getAccounts,
   getAccountById, deleteAccount, addTransaction,
   getRecentTransactions, addCustomCategory, getCustomCategories,
   getUserSettings, updateDailyLimit, getDailySpend, getWeeklySpend,
-  getAlertLog, logAlert, getTransactionsByDateRange,
+  logAlert, getTransactionsByDateRange,
   getTransactionsForCurrentMonth, getTransactionsForCurrentWeek,
   getCategorySuggestions, upsertCategorySuggestion, updateSmartLimit,
-  updateLimitRecalcTime, getAlertLogWithCooldown, getTransactionsByDayGrouped,
+  getAlertLogWithCooldown,
   getSessionData, setSessionData, clearSessionData,
-  updateAccountBalance, updateAccountName, addCorrectionRecord
+  updateAccountBalance, updateAccountName
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 
@@ -416,14 +416,10 @@ async function analyzeAndAlert(ctx, telegramId) {
 // ── COMMANDS MAIN ─────────────────────────────────────────────
 bot.command("start", async (ctx) => {
   const name = ctx.from.first_name || "Pengguna";
-  await upsertUser(ctx.from.id, name);
-  clearSession(ctx.chat.id);
-
-  // One-time removal of persistent keyboard for old users
-  await ctx.reply(".", {
-    reply_markup: { remove_keyboard: true }
-  }).then(msg => ctx.api.deleteMessage(ctx.chat.id, msg.message_id))
-    .catch(() => { });
+  await Promise.all([
+    upsertUser(ctx.from.id, name),
+    clearSession(ctx.chat.id),
+  ]);
 
   try {
     // Single parallel fetch for ALL data needed
