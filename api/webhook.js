@@ -27,16 +27,24 @@ for (const envVar of requiredEnvVars) {
 }
 
 // ── INISIALISASI BOT ───────────────────────────────────────────
-const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
+const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN, {
+  botInfo: {
+    id: 8639267051,
+    is_bot: true,
+    first_name: "MyDuit Ku",
+    username: "my_duitbot",
+    can_join_groups: true,
+    can_read_all_group_messages: false,
+    supports_inline_queries: false,
+    can_connect_to_business: false,
+    has_main_web_app: false,
+  }
+});
 
-// Initialize bot and DB in parallel at module level for cold start optimization
 let dbInitialized = false;
-const initPromise = Promise.all([
-  bot.init().catch(err => console.error("Bot init error:", err)),
-  initDB()
-    .then(() => { dbInitialized = true; })
-    .catch(err => console.error("DB init error:", err)),
-]);
+const initPromise = initDB()
+  .then(() => { dbInitialized = true; })
+  .catch(err => console.error("DB init error:", err));
 
 // ── SECURITY: OPTIONAL PRIVATE BOT WHITELIST ──────────────────
 // Only apply if ALLOWED_USER_ID is set in env
@@ -705,7 +713,6 @@ async function handlePrediksi(ctx) {
       getWeeklySpend(ctx.from.id, 0),
       getWeeklySpend(ctx.from.id, 1),
     ]);
-
   const smartDailyLimit = computeLimitFromData(settings, accounts);
   updateSmartLimit(ctx.from.id, smartDailyLimit).catch(() => { });
 
