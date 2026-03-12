@@ -326,27 +326,36 @@ async function calculateSmartLimit(telegramId) {
 // ── SMART ALERT SYSTEM ─────────────────────────────────────────
 async function analyzeAndAlert(ctx, telegramId) {
   try {
-    // Parallelize independent DB reads for performance
-    const [dailyLimit, accounts, todaySpend, thisWeek, lastWeek, thisMonthTxs] =
+    // FIX: fetch settings parallel bersama data lain
+    // Jangan panggil calculateSmartLimit — dia punya 3 sequential DB calls!
+    const [accounts, settings, todaySpend, thisWeek, lastWeek, thisMonthTxs] =
       await Promise.all([
-        calculateSmartLimit(telegramId),
         getAccounts(telegramId),
+        getUserSettings(telegramId),
         getDailySpend(telegramId),
         getWeeklySpend(telegramId, 0),
         getWeeklySpend(telegramId, 1),
         getTransactionsForCurrentMonth(telegramId),
       ]);
 
-    // Create prefetched data object for calculateScore
+    // Hitung limit dari data yang sudah ada — zero DB calls tambahan
+    const dailyLimit = computeLimitFromData(settings, accounts);
+
+    // Simpan limit ke DB tanpa menunggu (fire and forget)
+    updateSmartLimit(telegramId, dailyLimit).catch(() => {});
+
+    // Build prefetchedData — sertakan settings agar calculateScore
+    // tidak fetch getUserSettings lagi di dalamnya
     const prefetchedData = {
       todaySpend,
       accounts,
       thisMonthTxs,
       thisWeek,
       lastWeek,
+      settings,
     };
 
-    // Get scorecard with prefetched data (no redundant DB calls)
+    // Get scorecard dengan prefetched data (zero redundant DB calls)
     const scorecard = await calculateScore(telegramId, dailyLimit, prefetchedData);
     const { score, scoreEmoji, savingRate, usageRatio, balanceRatio } = scorecard;
 
@@ -434,14 +443,16 @@ async function analyzeAndAlert(ctx, telegramId) {
 // ── COMMANDS MAIN ─────────────────────────────────────────────
 bot.command("start", async (ctx) => {
   const name = ctx.from.first_name || "Pengguna";
+  const t0 = Date.now();
+
   await Promise.all([
     upsertUser(ctx.from.id, name),
     clearSession(ctx.chat.id),
   ]);
+  console.log(`⏱ /start step1 upsert+clear: ${Date.now() - t0}ms`);
 
   try {
-    // Step 2: SATU Promise.all untuk SEMUA data yang dibutuhkan
-    // Termasuk settings — sehingga calculateSmartLimit tidak perlu dipanggil
+    const t1 = Date.now();
     const [
       accounts,
       settings,
@@ -457,31 +468,21 @@ bot.command("start", async (ctx) => {
       getWeeklySpend(ctx.from.id, 1),
       getTransactionsForCurrentMonth(ctx.from.id),
     ]);
+    console.log(`⏱ /start step2 parallel fetch: ${Date.now() - t1}ms`);
 
-    // Hitung limit dari data yang sudah ada — ZERO DB calls tambahan
     const dailyLimit = computeLimitFromData(settings, accounts);
 
-    // Simpan limit ke DB tanpa menunggu (fire and forget)
     updateSmartLimit(ctx.from.id, dailyLimit).catch(err =>
       console.error("updateSmartLimit error:", err)
     );
 
-    // Build prefetchedData — sertakan settings agar calculateScore
-    // tidak fetch getUserSettings lagi di dalamnya
-    const prefetchedData = {
-      todaySpend,
-      accounts,
-      thisMonthTxs,
-      thisWeek,
-      lastWeek,
-      settings,
-    };
+    const prefetchedData = { todaySpend, accounts, thisMonthTxs, thisWeek, lastWeek, settings };
 
-    // calculateScore tidak akan fetch DB lagi karena prefetchedData lengkap
+    const t2 = Date.now();
     const scorecard = await calculateScore(ctx.from.id, dailyLimit, prefetchedData);
+    console.log(`⏱ /start step3 calculateScore: ${Date.now() - t2}ms`);
     const { score, scoreEmoji } = scorecard;
 
-    // Hitung total saldo dari data yang sudah ada
     const totalSaldo = accounts.reduce((sum, acc) => sum + acc.balance, 0);
 
     // --- DYNAMIC TIP (score-based, max 1 line) ---
@@ -518,7 +519,10 @@ bot.command("start", async (ctx) => {
         `Mau ngapain hari ini\\?`;
     }
 
+    const t3 = Date.now();
     await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: startKeyboard });
+    console.log(`⏱ /start step4 reply: ${Date.now() - t3}ms`);
+    console.log(`⏱ /start TOTAL: ${Date.now() - t0}ms`);
 
   } catch (err) {
     console.error("Error in /start:", err);
@@ -1392,16 +1396,21 @@ export default async function handler(req, res) {
     return res.status(200).json({ status: "MyDuit Ku Bot is running 💰" });
   }
 
-  // Security: Validate request is from Telegram
   const secret = req.headers["x-telegram-bot-api-secret-token"];
   if (process.env.WEBHOOK_SECRET && secret !== process.env.WEBHOOK_SECRET) {
     console.warn("Unauthorized webhook request blocked");
     return res.status(401).json({ error: "Unauthorized" });
   }
 
+  const t0 = Date.now();
+
   try {
     await initPromise;
+    console.log(`⏱ initPromise: ${Date.now() - t0}ms`);
+
     await bot.handleUpdate(req.body);
+    console.log(`⏱ handleUpdate: ${Date.now() - t0}ms`);
+
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Bot error:", err);
