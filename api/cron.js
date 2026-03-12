@@ -37,16 +37,12 @@ export default async function handler(req, res) {
 
     for (const user of users) {
       try {
-        if (isMonthlyReport) {
-          await sendMonthlyReport(user.telegram_id, user.name);
-          results.sent++;
-        } else if (isDailyReminder) {
-          const sent = await sendDailyReminder(user.telegram_id, user.name);
-          sent ? results.sent++ : results.skipped++;
-        }
-        
-        // Always check low balance for all users
-        await sendLowBalanceAlert(user.telegram_id);
+        // Parallelize per-user operations: monthly/daily reports and low balance alert
+        await Promise.all([
+          isMonthlyReport ? sendMonthlyReport(user.telegram_id, user.name).then(() => results.sent++) : Promise.resolve(),
+          isDailyReminder ? sendDailyReminder(user.telegram_id, user.name).then(sent => { if (sent) results.sent++; else results.skipped++; }) : Promise.resolve(),
+          sendLowBalanceAlert(user.telegram_id),
+        ]);
         
       } catch (err) {
         console.error(`Error for user ${user.telegram_id}:`, err);

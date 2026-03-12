@@ -29,14 +29,14 @@ for (const envVar of requiredEnvVars) {
 // ── INISIALISASI BOT ───────────────────────────────────────────
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
-// Initialize bot once at module level (outside handler)
-(async () => {
-  try {
-    await bot.init();
-  } catch (err) {
-    console.error("Bot init error:", err);
-  }
-})();
+// Initialize bot and DB in parallel at module level for cold start optimization
+let dbInitialized = false;
+const initPromise = Promise.all([
+  bot.init().catch(err => console.error("Bot init error:", err)),
+  initDB()
+    .then(() => { dbInitialized = true; })
+    .catch(err => console.error("DB init error:", err)),
+]);
 
 // ── SECURITY: OPTIONAL PRIVATE BOT WHITELIST ──────────────────
 // Only apply if ALLOWED_USER_ID is set in env
@@ -69,16 +69,6 @@ function isRateLimited(telegramId) {
   if (now - last < 1000) return true;
   rateLimitMap.set(String(telegramId), now);
   return false;
-}
-
-// DB Initialization caching
-let dbInitialized = false;
-
-async function ensureDB() {
-  if (!dbInitialized) {
-    await initDB();
-    dbInitialized = true;
-  }
 }
 
 // ── SESSION MANAGEMENT (Turso-backed) ──────────────────────────
@@ -135,12 +125,26 @@ function isValidNominal(val) {
 }
 
 // ── SCORE CALCULATION ──────────────────────────────────────────
-async function calculateScore(telegramId, dailyLimit) {
+async function calculateScore(telegramId, dailyLimit, prefetchedData = null) {
   let score = 100;
 
-  // Get stats
-  const todaySpend = await getDailySpend(telegramId);
-  const accounts = await getAccounts(telegramId);
+  // Use prefetched data if available, otherwise fetch from DB
+  let todaySpend, accounts, thisMonthTxs;
+  if (prefetchedData) {
+    todaySpend = prefetchedData.todaySpend;
+    accounts = prefetchedData.accounts;
+    thisMonthTxs = prefetchedData.thisMonthTxs;
+  } else {
+    const [spend, accts, txs] = await Promise.all([
+      getDailySpend(telegramId),
+      getAccounts(telegramId),
+      getTransactionsForCurrentMonth(telegramId),
+    ]);
+    todaySpend = spend;
+    accounts = accts;
+    thisMonthTxs = txs;
+  }
+  
   const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
   const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
 
@@ -163,15 +167,18 @@ async function calculateScore(telegramId, dailyLimit) {
   }
 
   // Factor 3: Weekly Trend (25pts)
-  const thisWeek = await getWeeklySpend(telegramId, 0);
-  const lastWeek = await getWeeklySpend(telegramId, 1);
+  const [thisWeek, lastWeek] = prefetchedData ? [prefetchedData.thisWeek, prefetchedData.lastWeek] : 
+    await Promise.all([
+      getWeeklySpend(telegramId, 0),
+      getWeeklySpend(telegramId, 1),
+    ]);
   if (lastWeek > 0) {
     if (thisWeek > lastWeek * 1.3) score -= 25;
     else if (thisWeek > lastWeek * 1.1) score -= 10;
   }
 
   // Factor 4: Saving Behavior (20pts)
-  const thisMonthTxs = await getTransactionsForCurrentMonth(telegramId);
+  if (!thisMonthTxs) thisMonthTxs = await getTransactionsForCurrentMonth(telegramId);
   let monthIncome = 0;
   let monthSpend = 0;
   for (const tx of thisMonthTxs) {
@@ -228,20 +235,33 @@ async function calculateSmartLimit(telegramId) {
 // ── SMART ALERT SYSTEM ─────────────────────────────────────────
 async function analyzeAndAlert(ctx, telegramId) {
   try {
-    // Always recalculate Smart Limit for up-to-date data
-    const dailyLimit = await calculateSmartLimit(telegramId);
+    // Parallelize independent DB reads for performance
+    const [dailyLimit, accounts, todaySpend, thisWeek, lastWeek, thisMonthTxs] =
+      await Promise.all([
+        calculateSmartLimit(telegramId),
+        getAccounts(telegramId),
+        getDailySpend(telegramId),
+        getWeeklySpend(telegramId, 0),
+        getWeeklySpend(telegramId, 1),
+        getTransactionsForCurrentMonth(telegramId),
+      ]);
 
-    // Get scorecard
-    const scorecard = await calculateScore(telegramId, dailyLimit);
+    // Create prefetched data object for calculateScore
+    const prefetchedData = {
+      todaySpend,
+      accounts,
+      thisMonthTxs,
+      thisWeek,
+      lastWeek,
+    };
+
+    // Get scorecard with prefetched data (no redundant DB calls)
+    const scorecard = await calculateScore(telegramId, dailyLimit, prefetchedData);
     const { score, scoreEmoji, savingRate, usageRatio, balanceRatio } = scorecard;
 
-    // Get stats
-    const accounts = await getAccounts(telegramId);
+    // Compute derived stats from already-fetched data
     const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
     const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
-    const todaySpend = await getDailySpend(telegramId);
-    const thisWeek = await getWeeklySpend(telegramId, 0);
-    const lastWeek = await getWeeklySpend(telegramId, 1);
 
     // ── PROGRESS BAR ──
     const rawBarRatio = dailyLimit > 0 
@@ -332,17 +352,51 @@ bot.command("start", async (ctx) => {
   }).then(msg => ctx.api.deleteMessage(ctx.chat.id, msg.message_id))
     .catch(() => { });
 
-  await ctx.reply(
-    `👋 *Halo, ${esc(name)}\\!*\n\n` +
-    `Selamat datang di *MyDuit Ku* 💰\n` +
-    `Bot pribadimu untuk mencatat saldo & transaksi keuangan\\.\n\n` +
-    `Pilih menu di bawah ini untuk memulai:`,
-    { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
-  );
+  try {
+    // Fetch data in parallel
+    const [accounts, score, todaySpend] = await Promise.all([
+      getAccounts(ctx.from.id),
+      calculateScore(ctx.from.id),
+      getTodaySpend(ctx.from.id)
+    ]);
+
+    // Calculate total saldo
+    let totalSaldo = 0;
+    for (const acc of accounts) {
+      totalSaldo += acc.balance;
+    }
+
+    // Determine score emoji
+    let scoreEmoji = "🔴";
+    if (score >= 80) scoreEmoji = "🟢";
+    else if (score >= 60) scoreEmoji = "🟡";
+
+    // Generate dynamic tip
+    let tip = "Catat setiap transaksi untuk analisis yang lebih baik\\!";
+    if (score < 50) tip = "Kondisi keuanganmu kritis\\! Prioritaskan kebutuhan pokok\\.";
+    else if (totalSaldo < 500000) tip = "Saldo sedang mepet\\. Hemat pengeluaran untuk bulan depan\\.";
+    else if (todaySpend > totalSaldo * 0.05) tip = "Pengeluaran hari ini lumayan\\. Pertimbangkan rencana belanja selanjutnya\\.";
+    else if (score >= 80) tip = "Mantap\\! Keuanganmu sehat hari ini\\.";
+
+    const text = `👋 Halo, ${esc(name)}\\! Welcome back to MyDuit Ku 💰\n` +
+      `💵 Total Saldo: ${esc(formatRupiah(totalSaldo))}\n` +
+      `🎯 Skor Kesehatan: ${esc(score.toString())}/100 ${esc(scoreEmoji)}\n` +
+      `📌 Tips Hari Ini: ${tip}\n\n` +
+      `Yuk mulai cek atau catat transaksi baru\\! 👇`;
+
+    await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: startKeyboard });
+  } catch (err) {
+    console.error("Error in /start:", err);
+    await ctx.reply(
+      `👋 Halo, ${esc(name)}\\! Welcome back to MyDuit Ku 💰\n\n` +
+      `Yuk mulai cek atau catat transaksi baru\\! 👇`,
+      { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
+    );
+  }
 });
 
 async function handleSaldo(ctx) {
-  clearSession(ctx.chat.id);
+  await clearSession(ctx.chat.id);
   const accounts = await getAccounts(ctx.from.id);
   if (accounts.length === 0) return ctx.reply(`💳 Belum ada rekening tercatat\\.\n\nGunakan /tambahbank untuk menambahkan rekening pertamamu\\.`, { parse_mode: "MarkdownV2" });
 
@@ -358,7 +412,7 @@ async function handleSaldo(ctx) {
 }
 
 async function handleRiwayat(ctx) {
-  clearSession(ctx.chat.id);
+  await clearSession(ctx.chat.id);
   const txs = await getRecentTransactions(ctx.from.id, 10);
   if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2" });
 
@@ -368,16 +422,18 @@ async function handleRiwayat(ctx) {
     const sign = tx.type === "masuk" ? "\\+" : "\\-";
     const label = tx.type === "masuk" ? tx.source || "" : tx.category || "";
 
+    const txDate = new Date(tx.created_at.replace(' ', 'T'));
+    const dateStr = txDate.toLocaleDateString('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
     text += `${icon} ${sign}${esc(formatRupiah(tx.amount))}\n`;
     text += `   📂 ${esc(tx.bank_name)} ` + (label ? `\\- ${esc(label)}` : "");
     if (tx.note) text += ` • _${esc(tx.note)}_`;
-    text += `\n   🕐 ${esc(formatDate(tx.created_at))}\n\n`;
+    text += `\n   ${esc(dateStr)}\n\n`;
   }
   await ctx.reply(text, { parse_mode: "MarkdownV2" });
 }
 
 async function handleHapusBank(ctx) {
-  clearSession(ctx.chat.id);
+  await clearSession(ctx.chat.id);
   const accounts = await getAccounts(ctx.from.id);
   if (accounts.length === 0) return ctx.reply(`⚠️ Tidak ada rekening untuk dihapus\\.`, { parse_mode: "MarkdownV2" });
 
@@ -442,35 +498,55 @@ async function handleSetLimit(ctx) {
 bot.command("setlimit", handleSetLimit);
 
 bot.command("settings", async (ctx) => {
-  clearSession(ctx.chat.id);
+  await clearSession(ctx.chat.id);
   await ctx.reply(`⚙️ *Pengaturan MyDuit Ku*\n\nPilih opsi yang ingin diatur:`, { parse_mode: "MarkdownV2", reply_markup: pengaturanKeyboard });
 });
 
 async function handlePrediksi(ctx) {
-  clearSession(ctx.chat.id);
+  await clearSession(ctx.chat.id);
   const txs = await getTransactionsByDateRange(ctx.from.id, 'keluar', 30);
   if (txs.length === 0) return ctx.reply(`🔮 Belum ada data pengeluaran 30 hari terakhir\\.`, { parse_mode: "MarkdownV2" });
 
-  // Get Smart Limit which already calculates ML background
-  const smartDailyLimit = await calculateSmartLimit(ctx.from.id);
+  // Parallelize independent DB reads
+  const [smartDailyLimit, accounts, todaySpend, thisMonthTxs] =
+    await Promise.all([
+      calculateSmartLimit(ctx.from.id),
+      getAccounts(ctx.from.id),
+      getDailySpend(ctx.from.id),
+      getTransactionsForCurrentMonth(ctx.from.id),
+    ]);
 
   let total30 = 0, last7 = 0, prev7 = 0;
   const categoryMap = new Map();
   const now = new Date();
+
+  // BUG FIX 3: Use date-only comparison to avoid timezone ambiguity
+  // created_at is WIB localtime, append "Z" causes 7-hour offset
+  const nowWIB = new Date(now.getTime() + (7 * 60 * 60 * 1000));
+  const todayStr = nowWIB.toISOString().split('T')[0]; // "YYYY-MM-DD"
+  const todayDateOnly = new Date(todayStr);
 
   for (const tx of txs) {
     total30 += tx.amount;
     const cat = tx.category || "Lainnya";
     categoryMap.set(cat, (categoryMap.get(cat) || 0) + tx.amount);
 
-    const txDate = new Date(tx.created_at + "Z");
-    const diffDays = Math.floor((now - txDate) / (1000 * 60 * 60 * 24));
+    // BUG FIX 3: Compare only date part (no time, no timezone)
+    const txDateStr = tx.created_at.split(' ')[0]; // "YYYY-MM-DD"
+    const txDateOnly = new Date(txDateStr);
+    const diffDays = Math.floor((todayDateOnly - txDateOnly) / (1000 * 60 * 60 * 24));
 
     if (diffDays < 7) last7 += tx.amount;
     else if (diffDays >= 7 && diffDays < 14) prev7 += tx.amount;
   }
 
-  const avg30 = total30 / 30;
+  // BUG FIX 2: Calculate avg30 by actual days since oldest transaction
+  // txs is sorted DESC, so oldest tx is at the end
+  const oldestTx = txs[txs.length - 1];
+  const oldestDate = new Date(oldestTx.created_at.replace(' ', 'T'));
+  const actualDays = Math.max(1, Math.round((now - oldestDate) / (1000 * 60 * 60 * 24)));
+  const effectiveDays = Math.min(30, actualDays);
+  const avg30 = total30 / effectiveDays;
   const last7Avg = last7 / 7;
   const prev7Avg = prev7 / 7;
 
@@ -482,28 +558,33 @@ async function handlePrediksi(ctx) {
     else if (last7Avg < prev7Avg) { trendStr = "menurun"; trendEmoji = "📉"; multiplier = 0.9; }
   }
 
-  const accounts = await getAccounts(ctx.from.id);
   const totalBalance = accounts.reduce((sum, acc) => sum + acc.balance, 0);
   const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
 
-  // Exact Days to empty using Smart Limit (adjusted)
-  const daysUntilEmpty = smartDailyLimit > 0 ? Math.floor(totalBalance / smartDailyLimit) : 999;
+  // BUG FIX 1: Use actual daily average (avg30) instead of smartDailyLimit
+  // smartDailyLimit = totalBalance * 0.20, so always results in 5 days
+  const daysUntilEmpty = avg30 > 0 ? Math.floor(totalBalance / avg30) : 999;
   const predictedDate = new Date();
   predictedDate.setDate(predictedDate.getDate() + daysUntilEmpty);
 
   const sortedCats = Array.from(categoryMap.entries()).sort((a, b) => b[1] - a[1]);
 
-  // Calculate Score using shared function
-  const scorecard = await calculateScore(ctx.from.id, smartDailyLimit);
+  // Create prefetched data for calculateScore
+  const prefetchedData = {
+    todaySpend,
+    accounts,
+    thisMonthTxs,
+  };
+
+  // Calculate Score with prefetched data (no redundant DB calls)
+  const scorecard = await calculateScore(ctx.from.id, smartDailyLimit, prefetchedData);
   const { score, scoreEmoji: scoreEmojiBase } = scorecard;
   let scoreEmoji = "🔴";
   if (score >= 90) scoreEmoji = "💚";
   else if (score >= 70) scoreEmoji = "🟡";
   else if (score >= 50) scoreEmoji = "🟠";
 
-  // Get data for advice
-  const todaySpend = await getDailySpend(ctx.from.id);
-  const thisMonthTxs = await getTransactionsForCurrentMonth(ctx.from.id);
+  // Compute saving rate from already-fetched thisMonthTxs
   let monthIncome = 0;
   let monthSpend = 0;
   for (const tx of thisMonthTxs) {
@@ -544,7 +625,7 @@ async function handlePrediksi(ctx) {
 }
 
 async function generateReport(ctx, isMonthly) {
-  clearSession(ctx.chat.id);
+  await clearSession(ctx.chat.id);
   const telegramId = ctx.from.id;
   const txs = isMonthly ? await getTransactionsForCurrentMonth(telegramId) : await getTransactionsForCurrentWeek(telegramId);
 
@@ -557,7 +638,7 @@ async function generateReport(ctx, isMonthly) {
   let periodStart = new Date();
   let periodEnd = new Date();
   if (txs.length > 0) {
-    const dates = txs.map(t => new Date(t.created_at + "Z"));
+    const dates = txs.map(t => new Date(t.created_at.replace(' ', 'T')));
     periodStart = new Date(Math.min(...dates));
     periodEnd = new Date(Math.max(...dates));
   }
@@ -878,19 +959,30 @@ bot.on("callback_query:data", async (ctx) => {
   }
 
   if (data === "catat_simpan") {
-    await addTransaction(ctx.from.id, sess.accountId, sess.type, sess.amount, sess.note, sess.category, sess.source);
+    try {
+      await addTransaction(ctx.from.id, sess.accountId, sess.type, sess.amount, sess.note, sess.category, sess.source);
 
-    const acc = await getAccountById(sess.accountId, ctx.from.id);
-    const icon = sess.type === "masuk" ? "⬆️" : "⬇️";
-    const labelKategori = sess.type === "masuk" ? sess.source : sess.category;
+      const acc = await getAccountById(sess.accountId, ctx.from.id);
+      const icon = sess.type === "masuk" ? "⬆️" : "⬇️";
+      const labelKategori = sess.type === "masuk" ? sess.source : sess.category;
 
-    await clearSession(chatId);
+      await clearSession(chatId);
 
-    const msg = `✅ *Transaksi Berhasil Dicatat\\!*\n──────────────────\n🏦 *${esc(acc.bank_name)}*\n${esc(icon)} ${esc(labelKategori)} — ${esc(formatRupiah(sess.amount))}\n${sess.note ? `📝 _${esc(sess.note)}_\n\n` : "\n"}💰 Saldo terkini: *${esc(formatRupiah(acc.balance))}*`;
+      const msg = `✅ *Transaksi Berhasil Dicatat\\!*\n──────────────────\n🏦 *${esc(acc.bank_name)}*\n${esc(icon)} ${esc(labelKategori)} — ${esc(formatRupiah(sess.amount))}\n${sess.note ? `📝 _${esc(sess.note)}_\n\n` : "\n"}💰 Saldo terkini: *${esc(formatRupiah(acc.balance))}*`;
 
-    await ctx.editMessageText(msg, { parse_mode: "MarkdownV2" });
+      const kbCatatLagi = new InlineKeyboard()
+        .text("📝 Catat Lagi", "menu_catat")
+        .text("🏠 Menu Utama", "menu_start");
 
-    return analyzeAndAlert(ctx, ctx.from.id);
+      await ctx.editMessageText(msg, { parse_mode: "MarkdownV2", reply_markup: kbCatatLagi });
+
+      // Call analyzeAndAlert separately without blocking the response
+      analyzeAndAlert(ctx, ctx.from.id).catch(err => console.error("Analyze error:", err));
+    } catch (err) {
+      console.error("catat_simpan error:", err);
+      await ctx.editMessageText(`❌ Gagal menyimpan transaksi\\. Silakan coba lagi\\.`, { parse_mode: "MarkdownV2" });
+    }
+    return;
   }
 
   // ── EDIT REKENING ─────────────────────────────────────────
@@ -1122,7 +1214,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    await ensureDB();
+    await initPromise;
     await bot.handleUpdate(req.body);
     res.status(200).json({ ok: true });
   } catch (err) {
