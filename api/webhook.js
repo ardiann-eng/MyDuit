@@ -565,9 +565,9 @@ async function handleRiwayat(ctx) {
   if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2" });
 
   // Fetch data in parallel for footer
-  const [accounts, dailyLimit, todaySpend] = await Promise.all([
+  const [accounts, settings, todaySpend] = await Promise.all([
     getAccounts(ctx.from.id),
-    calculateSmartLimit(ctx.from.id),
+    getUserSettings(ctx.from.id),
     getDailySpend(ctx.from.id),
   ]);
   const dailyLimit = computeLimitFromData(settings, accounts);
