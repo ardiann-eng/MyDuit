@@ -327,8 +327,16 @@ async function extractTextFromImage(imageUrl) {
     });
 
     const data = await response.json();
-    if (data.IsErroredOnProcessing) return null;
-    return data.ParsedResults?.[0]?.ParsedText || null;
+    console.log("OCR response:", JSON.stringify(data).substring(0, 500));
+    if (data.IsErroredOnProcessing) {
+      console.log("OCR error:", data.ErrorMessage);
+      return null;
+    }
+    if (!data.ParsedResults || data.ParsedResults.length === 0) {
+      console.log("OCR no results");
+      return null;
+    }
+    return data.ParsedResults[0].ParsedText || null;
 
   } catch (err) {
     console.error("OCR API error:", err);
