@@ -347,80 +347,161 @@ async function extractTextFromImage(imageUrl) {
 
 // ── OCR: PARSE TRANSACTION FROM TEXT ──────────────────────────
 function parseTransactionFromText(text) {
-  const result = {
-    nominal: null,
-    type: "keluar",
-    merchant: null,
-    date: null,
-    category: "Lainnya",
-    raw: text,
-  };
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 1);
+  const transactions = [];
 
-  // Extract nominal — handle Rp85.000 / Rp 85.000 / Rp85,000
-  const nominalMatch = text.match(/Rp\.?\s*([\d.,]+)/i);
-  if (nominalMatch) {
-    const raw = nominalMatch[1].replace(/\./g, '').replace(',', '.');
-    result.nominal = parseFloat(raw);
+  // Cari semua nominal Rp di teks
+  const nominalRegex = /Rp\.?\s*([\d.,]+)/gi;
+  let match;
+  const nominalMatches = [];
+  while ((match = nominalRegex.exec(text)) !== null) {
+    const raw = match[1].replace(/\./g, '').replace(',', '.');
+    const nominal = parseFloat(raw);
+    if (!isNaN(nominal) && nominal >= 1000) {
+      nominalMatches.push({ nominal, index: match.index });
+    }
   }
 
-  const lowerText = text.toLowerCase();
+  // Kalau tidak ada nominal sama sekali, return kosong
+  if (nominalMatches.length === 0) return [];
 
-  // Detect type: masuk atau keluar
-  const masukKeywords = ['terima', 'masuk', 'kredit', 'top up', 'topup',
-    'isi saldo', 'transfer masuk', 'menerima', 'diterima'];
-  const keluarKeywords = ['transfer', 'kirim', 'pembayaran', 'pembelian',
-    'qris', 'tarik', 'debit', 'bayar', 'belanja'];
+  // Kalau hanya 1 nominal, gunakan parser lama (single transaction)
+  if (nominalMatches.length === 1) {
+    const lowerText = text.toLowerCase();
+    const masukKeywords = ['terima', 'masuk', 'kredit', 'top up', 'topup',
+      'isi saldo', 'transfer masuk', 'menerima', 'diterima'];
+    const keluarKeywords = ['transfer', 'kirim', 'pembayaran', 'pembelian',
+      'qris', 'tarik', 'debit', 'bayar', 'belanja'];
+    const hasMasuk = masukKeywords.some(k => lowerText.includes(k));
+    const hasKeluar = keluarKeywords.some(k => lowerText.includes(k));
+    let type = "keluar";
+    if (hasMasuk && !hasKeluar) type = "masuk";
 
-  const hasMasuk = masukKeywords.some(k => lowerText.includes(k));
-  const hasKeluar = keluarKeywords.some(k => lowerText.includes(k));
-
-  if (hasMasuk && !hasKeluar) result.type = "masuk";
-  else result.type = "keluar";
-
-  // Extract merchant name
-  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 2);
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (/^Rp/i.test(line)) continue;
-    if (/sukses|berhasil|gagal/i.test(line)) continue;
-    if (/\d{2}\s+(Jan|Feb|Mar|Apr|Mei|Jun|Jul|Ags|Sep|Okt|Nov|Des)/i.test(line)) continue;
-    if (/\d{8,}/.test(line)) continue; // skip nomor rekening panjang
-
-    // Baris setelah "Pembelian QRIS" biasanya merchant
-    if (/QRIS|Transfer|Pembelian|Pembayaran/i.test(line)) {
-      if (lines[i + 1] && !/^Rp/i.test(lines[i + 1]) && !/\d{8,}/.test(lines[i + 1])) {
-        result.merchant = lines[i + 1].trim();
+    let merchant = null;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (/^Rp/i.test(line)) continue;
+      if (/sukses|berhasil|gagal/i.test(line)) continue;
+      if (/\d{2}\s+(Jan|Feb|Mar|Apr|Mei|Jun|Jul|Ags|Sep|Okt|Nov|Des)/i.test(line)) continue;
+      if (/\d{8,}/.test(line)) continue;
+      if (/QRIS|Transfer|Pembelian|Pembayaran/i.test(line)) {
+        if (lines[i + 1] && !/^Rp/i.test(lines[i + 1]) && !/\d{8,}/.test(lines[i + 1])) {
+          merchant = lines[i + 1].trim();
+        }
+        continue;
       }
-      continue;
+      if (/^[A-Z][A-Z\s\-]{2,30}$/.test(line) && !merchant) {
+        merchant = line;
+      }
     }
 
-    // Nama merchant biasanya huruf kapital semua
-    if (/^[A-Z][A-Z\s\-]{2,30}$/.test(line) && !result.merchant) {
-      result.merchant = line;
-    }
+    const dateMatch = text.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|Mei|Jun|Jul|Ags|Sep|Okt|Nov|Des)\s+(\d{4}|\d{2})?/i);
+    let category = "Lainnya";
+    if (/alfamart|indomaret|supermarket|minimarket|warung/i.test(text)) category = "🍔 Makanan";
+    else if (/grab|gojek|ojek|taxi|parkir|bensin|pertamina/i.test(text)) category = "🚗 Transport";
+    else if (/listrik|pln|air|pdam|internet|telkom|wifi/i.test(text)) category = "🏠 Tagihan";
+    else if (/shopee|tokopedia|lazada|bukalapak/i.test(text)) category = "👗 Gaya Hidup";
+    else if (/game|steam|netflix|spotify|voucher/i.test(text)) category = "🎮 Hiburan";
+    else if (/apotek|rumah sakit|dokter|klinik/i.test(text)) category = "💊 Kesehatan";
+    else if (type === "masuk") category = "📦 Lainnya";
+
+    return [{
+      nominal: nominalMatches[0].nominal,
+      type,
+      merchant,
+      date: dateMatch ? dateMatch[0] : null,
+      category,
+    }];
   }
 
-  // Extract date
-  const dateMatch = text.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|Mei|Jun|Jul|Ags|Sep|Okt|Nov|Des)\s+(\d{4})/i);
-  if (dateMatch) result.date = dateMatch[0];
+  // Banyak nominal — coba parse per baris/blok
+  // Strategi: setiap nominal, cari konteks di sekitarnya (3 baris sebelum)
+  for (const { nominal, index } of nominalMatches) {
+    // Ambil teks sekitar nominal ini (200 karakter sebelumnya)
+    const contextStart = Math.max(0, index - 200);
+    const context = text.substring(contextStart, index + 50).toLowerCase();
 
-  // Auto-kategorisasi berdasarkan keyword
-  if (/alfamart|indomaret|supermarket|minimarket|warung/i.test(text))
-    result.category = "🍔 Makanan";
-  else if (/grab|gojek|ojek|taxi|parkir|bensin|pertamina|shell/i.test(text))
-    result.category = "🚗 Transport";
-  else if (/listrik|pln|air|pdam|internet|telkom|wifi|indihome/i.test(text))
-    result.category = "🏠 Tagihan";
-  else if (/shopee|tokopedia|lazada|bukalapak/i.test(text))
-    result.category = "👗 Gaya Hidup";
-  else if (/game|steam|netflix|spotify|voucher/i.test(text))
-    result.category = "🎮 Hiburan";
-  else if (/apotek|rumah sakit|dokter|klinik|kimia farma/i.test(text))
-    result.category = "💊 Kesehatan";
-  else if (result.type === "masuk")
-    result.category = "📦 Lainnya";
+    // Detect type dari konteks lokal
+    const masukKeywords = ['terima', 'masuk', 'kredit', 'top up', 'topup',
+      'menerima', 'diterima', 'cr', 'credit'];
+    const keluarKeywords = ['transfer', 'kirim', 'pembayaran', 'pembelian',
+      'qris', 'tarik', 'debit', 'bayar', 'belanja', 'dr', 'debet'];
+    const hasMasuk = masukKeywords.some(k => context.includes(k));
+    const hasKeluar = keluarKeywords.some(k => context.includes(k));
+    const type = (hasMasuk && !hasKeluar) ? "masuk" : "keluar";
 
-  return result;
+    // Cari merchant dari baris sebelum nominal
+    const contextLines = text.substring(contextStart, index)
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length > 2);
+    let merchant = null;
+    for (let i = contextLines.length - 1; i >= 0; i--) {
+      const line = contextLines[i];
+      if (/^Rp/i.test(line)) continue;
+      if (/sukses|berhasil|gagal|total|saldo/i.test(line)) continue;
+      if (/\d{8,}/.test(line)) continue;
+      if (/\d{2}[\/\-]\d{2}/.test(line)) continue;
+      if (line.length > 3 && line.length < 40) {
+        merchant = line;
+        break;
+      }
+    }
+
+    // Cari tanggal di konteks
+    const dateMatch = context.match(/(\d{1,2})\s+(jan|feb|mar|apr|mei|jun|jul|ags|sep|okt|nov|des)/i);
+    const date = dateMatch ? dateMatch[0] : null;
+
+    // Auto-kategori dari konteks
+    let category = "Lainnya";
+    if (/alfamart|indomaret|supermarket|minimarket|warung/.test(context)) category = "🍔 Makanan";
+    else if (/grab|gojek|ojek|taxi|parkir|bensin|pertamina/.test(context)) category = "🚗 Transport";
+    else if (/listrik|pln|air|pdam|internet|telkom|wifi/.test(context)) category = "🏠 Tagihan";
+    else if (/shopee|tokopedia|lazada|bukalapak/.test(context)) category = "👗 Gaya Hidup";
+    else if (/game|steam|netflix|spotify|voucher/.test(context)) category = "🎮 Hiburan";
+    else if (/apotek|rumah sakit|dokter|klinik/.test(context)) category = "💊 Kesehatan";
+    else if (type === "masuk") category = "📦 Lainnya";
+
+    transactions.push({ nominal, type, merchant, date, category });
+  }
+
+  return transactions;
+}
+
+async function showOcrKonfirmasi(ctx, sess, accounts) {
+  const list = sess.ocrList || [];
+  const i = sess.ocrIndex || 0;
+
+  if (i >= list.length) {
+    await clearSession(ctx.chat.id);
+    return ctx.editMessageText(
+      `✅ *Semua transaksi sudah dikonfirmasi\\!*`,
+      { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🏠 Menu Utama", "menu_start") }
+    );
+  }
+
+  const tx = list[i];
+  const typeIcon = tx.type === "masuk" ? "⬆️" : "⬇️";
+  const typeLabel = tx.type === "masuk" ? "Pemasukan" : "Pengeluaran";
+
+  let text = `📸 *Transaksi ${i + 1} dari ${list.length}*\n──────────────────\n`;
+  text += `${esc(typeIcon)} Jenis    : *${esc(typeLabel)}*\n`;
+  text += `💰 Nominal  : *${esc(formatRupiah(tx.nominal))}*\n`;
+  if (tx.merchant) text += `🏪 Merchant : *${esc(tx.merchant)}*\n`;
+  if (tx.date) text += `📅 Tanggal  : *${esc(tx.date)}*\n`;
+  text += `📂 Kategori : *${esc(tx.category)}*\n`;
+  text += `──────────────────\nSimpan ke rekening mana?`;
+
+  const kb = new InlineKeyboard();
+  for (const acc of accounts) {
+    kb.text(`🏦 ${acc.bank_name}`, `ocr_simpan1_${acc.id}`).row();
+  }
+  kb.text("⏭ Lewati", "ocr_lewati").text("❌ Batal Semua", "batal");
+
+  if (ctx.callbackQuery) {
+    return ctx.editMessageText(text, { parse_mode: "MarkdownV2", reply_markup: kb });
+  }
+  return ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
 }
 // ── ML SMART LIMIT ─────────────────────────────────────────────
 async function calculateSmartLimit(telegramId) {
@@ -1125,16 +1206,12 @@ bot.on("message:photo", async (ctx) => {
   });
 
   try {
-    // Ambil foto resolusi tertinggi
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     const file = await ctx.api.getFile(photo.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
 
-    // Kirim ke OCR.space
     const ocrText = await extractTextFromImage(fileUrl);
-
-    // Hapus pesan "Membaca..."
-    await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => { });
+    await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
 
     if (!ocrText) {
       return ctx.reply(
@@ -1143,48 +1220,44 @@ bot.on("message:photo", async (ctx) => {
       );
     }
 
-    const parsed = parseTransactionFromText(ocrText);
+    const parsedList = parseTransactionFromText(ocrText);
 
-    if (!parsed.nominal || isNaN(parsed.nominal) || parsed.nominal <= 0) {
+    if (!parsedList || parsedList.length === 0) {
       return ctx.reply(
-        `❌ Tidak dapat menemukan nominal transaksi\\.\nCoba screenshot yang lebih jelas, atau gunakan /catat manual\\.`,
+        `❌ Tidak dapat menemukan transaksi\\.\nCoba screenshot yang lebih jelas, atau gunakan /catat manual\\.`,
         { parse_mode: "MarkdownV2" }
       );
     }
 
-    // Simpan ke session
+    // Simpan semua transaksi ke session
     const sess = {};
     sess.step = "ocr_pilih_rekening";
-    sess.ocrNominal = parsed.nominal;
-    sess.ocrType = parsed.type;
-    sess.ocrMerchant = parsed.merchant || "";
-    sess.ocrCategory = parsed.category;
-    sess.ocrDate = parsed.date || "";
+    sess.ocrList = parsedList;         // array semua transaksi
+    sess.ocrIndex = 0;                 // index yang sedang dikonfirmasi
     await saveSession(ctx.chat.id, sess);
 
-    const typeIcon = parsed.type === "masuk" ? "⬆️" : "⬇️";
-    const typeLabel = parsed.type === "masuk" ? "Pemasukan" : "Pengeluaran";
-
-    let text = `📸 *Hasil Baca Screenshot*\n──────────────────\n`;
-    text += `${esc(typeIcon)} Jenis    : *${esc(typeLabel)}*\n`;
-    text += `💰 Nominal  : *${esc(formatRupiah(parsed.nominal))}*\n`;
-    if (parsed.merchant) text += `🏪 Merchant : *${esc(parsed.merchant)}*\n`;
-    if (parsed.date) text += `📅 Tanggal  : *${esc(parsed.date)}*\n`;
-    text += `📂 Kategori : *${esc(parsed.category)}*\n`;
-    text += `──────────────────\n`;
-    text += `Simpan ke rekening mana?`;
+    // Tampilkan ringkasan semua transaksi yang ditemukan
+    let summary = `📸 *Ditemukan ${parsedList.length} Transaksi*\n──────────────────\n`;
+    parsedList.forEach((tx, i) => {
+      const icon = tx.type === "masuk" ? "⬆️" : "⬇️";
+      summary += `${i + 1}\\. ${esc(icon)} *${esc(formatRupiah(tx.nominal))}*`;
+      if (tx.merchant) summary += ` — ${esc(tx.merchant)}`;
+      summary += `\n`;
+    });
+    summary += `──────────────────\nSimpan semua ke rekening mana?`;
 
     const kb = new InlineKeyboard();
     for (const acc of accounts) {
-      kb.text(`🏦 ${acc.bank_name} (${formatRupiah(acc.balance)})`, `ocr_simpan_${acc.id}`).row();
+      kb.text(`🏦 ${acc.bank_name} (${formatRupiah(acc.balance)})`, `ocr_bulk_${acc.id}`).row();
     }
+    kb.text("📝 Konfirmasi Satu per Satu", "ocr_satu_satu").row();
     kb.text("❌ Batal", "batal");
 
-    await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
+    await ctx.reply(summary, { parse_mode: "MarkdownV2", reply_markup: kb });
 
   } catch (err) {
     console.error("OCR handler error:", err);
-    await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => { });
+    await ctx.api.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
     await ctx.reply(
       `❌ Terjadi kesalahan\\. Gunakan /catat untuk input manual\\.`,
       { parse_mode: "MarkdownV2" }
@@ -1391,6 +1464,88 @@ bot.on("callback_query:data", async (ctx) => {
     }
     return;
   }
+  // ── OCR BULK SIMPAN (semua sekaligus) ─────────────────────
+  if (data.startsWith("ocr_bulk_")) {
+    const accId = parseInt(data.replace("ocr_bulk_", ""));
+    const acc = await getAccountById(accId, ctx.from.id);
+    if (!acc) return ctx.editMessageText("⚠️ Rekening tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+
+    const list = sess.ocrList || [];
+    if (list.length === 0) return ctx.editMessageText("⚠️ Data transaksi tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+
+    // Simpan semua transaksi sekaligus
+    for (const tx of list) {
+      await addTransaction(
+        ctx.from.id, accId, tx.type, tx.nominal,
+        tx.merchant || "Via foto",
+        tx.type === "keluar" ? tx.category : "Lainnya",
+        tx.type === "masuk" ? (tx.category || "📦 Lainnya") : ""
+      );
+    }
+
+    await clearSession(chatId);
+    const accAfter = await getAccountById(accId, ctx.from.id);
+
+    let msg = `✅ *${list.length} Transaksi Berhasil Dicatat\\!*\n──────────────────\n`;
+    list.forEach((tx, i) => {
+      const icon = tx.type === "masuk" ? "⬆️" : "⬇️";
+      msg += `${i + 1}\\. ${esc(icon)} ${esc(formatRupiah(tx.nominal))}`;
+      if (tx.merchant) msg += ` — ${esc(tx.merchant)}`;
+      msg += `\n`;
+    });
+    msg += `──────────────────\n💰 Saldo terkini: *${esc(formatRupiah(accAfter.balance))}*`;
+
+    const kb = new InlineKeyboard()
+      .text("📝 Catat Lagi", "menu_catat")
+      .text("🏠 Menu Utama", "menu_start");
+
+    await ctx.editMessageText(msg, { parse_mode: "MarkdownV2", reply_markup: kb });
+    analyzeAndAlert(ctx, ctx.from.id).catch(() => {});
+    return;
+  }
+
+  // ── OCR SATU PER SATU ─────────────────────────────────────
+  if (data === "ocr_satu_satu") {
+    const list = sess.ocrList || [];
+    if (list.length === 0) return ctx.editMessageText("⚠️ Data tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+
+    sess.ocrIndex = 0;
+    await saveSession(chatId, sess);
+
+    const accountsList = await getAccounts(ctx.from.id);
+    return showOcrKonfirmasi(ctx, sess, accountsList);
+  }
+
+  if (data.startsWith("ocr_simpan1_")) {
+    const accId = parseInt(data.replace("ocr_simpan1_", ""));
+    const acc = await getAccountById(accId, ctx.from.id);
+    if (!acc) return ctx.editMessageText("⚠️ Rekening tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+
+    const list = sess.ocrList || [];
+    const i = sess.ocrIndex || 0;
+    const tx = list[i];
+
+    await addTransaction(
+      ctx.from.id, accId, tx.type, tx.nominal,
+      tx.merchant || "Via foto",
+      tx.type === "keluar" ? tx.category : "Lainnya",
+      tx.type === "masuk" ? (tx.category || "📦 Lainnya") : ""
+    );
+
+    sess.ocrIndex = i + 1;
+    await saveSession(chatId, sess);
+
+    const accountsList = await getAccounts(ctx.from.id);
+    return showOcrKonfirmasi(ctx, sess, accountsList);
+  }
+
+  if (data === "ocr_lewati") {
+    sess.ocrIndex = (sess.ocrIndex || 0) + 1;
+    await saveSession(chatId, sess);
+    const accountsList = await getAccounts(ctx.from.id);
+    return showOcrKonfirmasi(ctx, sess, accountsList);
+  }
+
   // ── OCR SIMPAN ────────────────────────────────────────────
   if (data.startsWith("ocr_simpan_")) {
     const accId = parseInt(data.replace("ocr_simpan_", ""));
