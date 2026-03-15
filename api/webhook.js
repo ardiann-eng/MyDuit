@@ -1,5 +1,5 @@
 // api/webhook.js
-import { Bot, InlineKeyboard, webhookCallback } from "grammy";
+import { Bot, InlineKeyboard } from "grammy";
 import {
   initDB, upsertUser, addAccount, getAccounts,
   getAccountById, deleteAccount, addTransaction,
@@ -49,7 +49,7 @@ const initPromise = initDB()
   .then(() => { dbInitialized = true; })
   .catch(err => console.error("DB init error:", err));
 
-const vercelCallback = webhookCallback(bot, "http");
+
 
 // ── SECURITY: OPTIONAL PRIVATE BOT WHITELIST ──────────────────
 // Only apply if ALLOWED_USER_ID is set in env
@@ -1651,8 +1651,9 @@ export default async function handler(req, res) {
 
   try {
     await initPromise;
-    await vercelCallback(req, res);
+    await bot.handleUpdate(req.body);
     console.log(`⏱ handleUpdate (total): ${Date.now() - t0}ms`);
+    res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Bot error:", err);
     res.status(200).json({ ok: false });
