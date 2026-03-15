@@ -319,6 +319,7 @@ async function extractTextFromImage(imageUrl) {
     formData.append('detectOrientation', 'true');
     formData.append('scale', 'true');
     formData.append('OCREngine', '2'); // Engine 2 lebih akurat untuk screenshot
+    formData.append('filetype', 'JPG');
 
     const response = await fetch('https://api.ocr.space/parse/image', {
       method: 'POST',
