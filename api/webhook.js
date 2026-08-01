@@ -1028,7 +1028,7 @@ async function handleEditRekening(ctx) {
 
     const kb = new InlineKeyboard();
     for (const acc of accounts) {
-      kb.text(`🏦 ${esc(acc.bank_name)} — ${esc(formatRupiah(acc.balance))}`, `editrek_akun_${acc.id}`).row();
+      kb.text(`🏦 ${acc.bank_name} — ${formatRupiah(acc.balance)}`, `editrek_akun_${acc.id}`).row();
     }
     kb.text("❌ Batal", "batal");
 
@@ -1983,7 +1983,7 @@ bot.on("callback_query:data", async (ctx) => {
       .text("❌ Batal", "batal");
 
     return ctx.editMessageText(
-      `✏️ *Edit Rekening*\n\n🏦 ${esc(acc.bank_name)}\n💰 Saldo: *${esc(formatRupiah(acc.balance))}*\n\nPilih yang ingin diubah\.`,
+      `✏️ *Edit Rekening*\n\n🏦 ${esc(acc.bank_name)}\n💰 Saldo: *${esc(formatRupiah(acc.balance))}*\n\nPilih yang ingin diubah\\.`,
       { parse_mode: "MarkdownV2", reply_markup: kb }
     );
   }
