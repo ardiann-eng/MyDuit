@@ -1419,7 +1419,9 @@ bot.on("callback_query:data", async (ctx) => {
   }
 
   if (data.startsWith("menu_")) {
-    try { await ctx.deleteMessage(); } catch (e) { }
+    if (data !== "menu_lainnya") {
+      try { await ctx.deleteMessage(); } catch (e) { }
+    }
 
     if (data === "menu_start") {
       const name = ctx.from.first_name || "Pengguna";
@@ -1438,7 +1440,7 @@ bot.on("callback_query:data", async (ctx) => {
       parse_mode: "MarkdownV2",
       reply_markup: createReportKeyboard(),
     });
-    if (data === "menu_lainnya") return ctx.reply("☰ *Menu Lainnya*\n\nFitur laporan, scan, rekening, dan pengaturan\.", {
+    if (data === "menu_lainnya") return ctx.editMessageText("☰ *Menu Lainnya*\n\nFitur laporan, scan, rekening, dan pengaturan\\.", {
       parse_mode: "MarkdownV2",
       reply_markup: moreMenuKeyboard,
     });
