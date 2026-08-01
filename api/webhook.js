@@ -1588,7 +1588,7 @@ bot.on("callback_query:data", async (ctx) => {
     const walletId = parseCallbackId(data, "wallet_pick_");
     const wallet = walletId && await getSolWalletById(walletId, ctx.from.id);
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
-    return ctx.editMessageText(formatWalletDetail(wallet), { parse_mode: "MarkdownV2", reply_markup: createWalletActions(wallet) });
+    return ctx.editMessageText(await formatWalletDetail(wallet), { parse_mode: "MarkdownV2", reply_markup: createWalletActions(wallet) });
   }
 
   if (data.startsWith("wallet_sync_")) {
@@ -1597,7 +1597,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
     try {
       const lamports = await syncSolWallet(wallet);
-      return ctx.editMessageText(formatWalletDetail({ ...wallet, last_balance_lamports: lamports }), { parse_mode: "MarkdownV2", reply_markup: createWalletActions(wallet) });
+      return ctx.editMessageText(await formatWalletDetail({ ...wallet, last_balance_lamports: lamports }), { parse_mode: "MarkdownV2", reply_markup: createWalletActions(wallet) });
     } catch (error) {
       return ctx.reply("⚠️ Sync wallet gagal\. Saldo terakhir tetap disimpan\. Coba lagi nanti\.", { parse_mode: "MarkdownV2" });
     }
