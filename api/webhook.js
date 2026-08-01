@@ -52,6 +52,8 @@ const initPromise = initDB()
   .then(() => { dbInitialized = true; })
   .catch(err => console.error("DB init error:", err));
 
+let solPriceCache = { value: null, expiresAt: 0 };
+
 
 
 // ── SECURITY: OPTIONAL PRIVATE BOT WHITELIST ──────────────────
@@ -127,7 +129,7 @@ const moreMenuKeyboard = new InlineKeyboard()
   .text("📸 Scan Screenshot", "menu_scan").row()
   .text("🏦 Tambah Rekening", "menu_tambahbank")
   .text("✏️ Edit Rekening", "menu_editrekening").row()
-  .text("◎ Wallet SOL", "menu_wallet")
+  .text("🪙 Wallet Solana", "menu_wallet")
   .text("⚙️ Pengaturan", "menu_settings")
   .text("🏠 Menu Utama", "menu_start");
 
@@ -214,17 +216,67 @@ async function syncSolWallet(wallet) {
   }
 }
 
+function getWalletBalance(wallet) {
+  return wallet.last_balance_lamports ? formatSol(wallet.last_balance_lamports) : "Belum disinkronkan";
+}
+
+function createWalletActions(wallet) {
+  return new InlineKeyboard()
+    .text("🔄 Sinkronkan", `wallet_sync_${wallet.id}`)
+    .text("✏️ Ganti Nama", `wallet_rename_${wallet.id}`).row()
+    .text("🔗 Ganti Address", `wallet_address_${wallet.id}`).row()
+    .text("🗑 Hapus Wallet", `wallet_delete_${wallet.id}`).row()
+    .text("⬅️ Semua Wallet", "menu_wallet");
+}
+
+async function formatWalletDetail(wallet) {
+  const lamports = wallet.last_balance_lamports;
+  const balance = lamports ? formatSolEstimate(BigInt(lamports), await getSolPrices()) : "Belum disinkronkan";
+  return `🪙 *${esc(wallet.label)}*\n\n` +
+    `🟣 *Your Solana Wallet Address*\n` +
+    `├ \`${wallet.address}\`\n` +
+    `└ *${esc(balance)}*`;
+}
+
+async function getSolPrices() {
+  if (solPriceCache.expiresAt > Date.now()) return solPriceCache.value;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd,idr", { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!response.ok) throw new Error(`SOL price HTTP ${response.status}`);
+    const solana = (await response.json())?.solana;
+    const prices = { usd: Number(solana?.usd), idr: Number(solana?.idr) };
+    if (!Number.isFinite(prices.usd) || prices.usd <= 0 || !Number.isFinite(prices.idr) || prices.idr <= 0) throw new Error("SOL price response invalid");
+    solPriceCache = { value: prices, expiresAt: Date.now() + 5 * 60 * 1000 };
+    return prices;
+  } catch (error) {
+    console.warn("SOL price unavailable:", error.message);
+    solPriceCache = { value: null, expiresAt: Date.now() + 60 * 1000 };
+    return null;
+  }
+}
+
+function formatSolEstimate(lamports, solPrices) {
+  const sol = Number(lamports) / 1_000_000_000;
+  if (!solPrices?.usd || !Number.isFinite(sol)) return `${formatSol(lamports)} (estimasi USD belum tersedia)`;
+  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(sol * solPrices.usd);
+  return `${formatSol(lamports)} (est. USD ${usd})`;
+}
+
 async function handleWallet(ctx) {
   await clearSession(ctx.chat.id);
   const wallets = await getSolWallets(ctx.from.id);
-  let text = "◎ *Wallet SOL*\n\n";
-  if (!wallets.length) text += "Belum ada wallet yang dipantau\\.\n";
+  let text = "🪙 *Wallet Solana*\n_Pantau saldo SOL dari public address_\n\n";
+  if (!wallets.length) text += "Belum ada wallet aktif\\. Tambahkan public address untuk mulai memantau saldo\\.\n";
   for (const wallet of wallets) {
-    const balance = wallet.last_balance_lamports ? formatSol(wallet.last_balance_lamports) : "Belum disinkronkan";
-    text += `*${esc(wallet.label)}*\n${esc(shortenSolAddress(wallet.address))}\n${esc(balance)}\n\n`;
+    text += `🪙 *${esc(wallet.label)}*\n`;
+    text += `💰 ${esc(getWalletBalance(wallet))}\n`;
+    text += `🔗 \`${shortenSolAddress(wallet.address)}\`\n\n`;
   }
   const kb = new InlineKeyboard().text("➕ Tambah Wallet", "wallet_add");
-  for (const wallet of wallets) kb.row().text(`⚙️ ${wallet.label}`, `wallet_pick_${wallet.id}`);
+  for (const wallet of wallets) kb.row().text(`🪙 ${wallet.label}`, `wallet_pick_${wallet.id}`);
   kb.row().text("🏠 Menu Utama", "menu_start");
   return ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
 }
@@ -834,15 +886,9 @@ async function analyzeAndAlert(ctx, telegramId) {
 }
 
 // ── COMMANDS MAIN ─────────────────────────────────────────────
-bot.command("start", async (ctx) => {
+async function showMainMenu(ctx) {
   const name = ctx.from.first_name || "Pengguna";
   const t0 = Date.now();
-
-  await Promise.all([
-    upsertUser(ctx.from.id, name),
-    clearSession(ctx.chat.id),
-  ]);
-  console.log(`⏱ /start step1 upsert+clear: ${Date.now() - t0}ms`);
 
   try {
     const t1 = Date.now();
@@ -853,6 +899,7 @@ bot.command("start", async (ctx) => {
       thisWeek,
       lastWeek,
       thisMonthTxs,
+      wallets,
     ] = await Promise.all([
       getAccounts(ctx.from.id),
       getUserSettings(ctx.from.id),
@@ -860,6 +907,7 @@ bot.command("start", async (ctx) => {
       getWeeklySpend(ctx.from.id, 0),
       getWeeklySpend(ctx.from.id, 1),
       getTransactionsForCurrentMonth(ctx.from.id),
+      getSolWallets(ctx.from.id),
     ]);
     console.log(`⏱ /start step2 parallel fetch: ${Date.now() - t1}ms`);
 
@@ -877,6 +925,8 @@ bot.command("start", async (ctx) => {
     const { score, scoreEmoji } = scorecard;
 
     const totalSaldo = accounts.reduce((sum, acc) => sum + acc.balance, 0);
+    const syncedWallets = wallets.filter((wallet) => wallet.last_balance_lamports !== null && wallet.last_balance_lamports !== undefined);
+    const totalLamports = syncedWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_lamports), 0n);
 
     // --- DYNAMIC TIP (score-based, max 1 line) ---
     let tip;
@@ -892,25 +942,19 @@ bot.command("start", async (ctx) => {
       tip = "Kondisi kritis\\! Kurangi pengeluaran non\\-esensial sekarang\\.  🚨";
     }
 
-    // --- FORMAT MESSAGE ---
-    let text;
-    if (accounts.length > 0) {
-      text =
-        `👋 Hai, *${esc(name)}\\!*\n` +
-        `Yuk cek kondisi keuanganmu hari ini\\! 🔍\n\n` +
-        `💰 Total Saldo: *${esc(formatRupiah(totalSaldo))}*\n` +
-        `🎯 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n` +
-        `💡 _${tip}_\n\n` +
-        `Mau ngapain hari ini\\?`;
-    } else {
-      text =
-        `👋 Hai, *${esc(name)}\\!*\n` +
-        `Yuk cek kondisi keuanganmu hari ini\\! 🔍\n\n` +
-        `💳 Belum ada rekening tercatat\n` +
-        `🎯 Skor Kesehatan: *0/100*\n` +
-        `💡 _${tip}_\n\n` +
-        `Mau ngapain hari ini\\?`;
+    const solPrices = syncedWallets.length ? await getSolPrices() : null;
+    const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
+    const totalRekening = totalSaldo + solValueIdr;
+    let text = `👋 Hai, *${esc(name)}\\!*\nYuk cek kondisi keuanganmu hari ini\\! 🔍\n\n`;
+    text += accounts.length || wallets.length
+      ? `💳 *Total Rekening*\n└ *${esc(formatRupiah(totalRekening))}*\n\n`
+      : "💳 Belum ada rekening atau wallet tercatat\\.\n\n";
+    if (wallets.length) {
+      const totalSol = syncedWallets.length ? `*${esc(formatSolEstimate(totalLamports, solPrices))}*` : "Belum disinkronkan";
+      text += `🪙 *Total Wallet Solana*\n├ ${wallets.length} wallet aktif\n└ ${totalSol}\n\n`;
     }
+    text += `🎯 Skor Kesehatan: *${esc((accounts.length ? score : 0).toString())}/100*${accounts.length ? ` ${esc(scoreEmoji)}` : ""}\n`;
+    text += `💡 _${tip}_\n\nMau ngapain hari ini\\?`;
 
     const t3 = Date.now();
     await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: startKeyboard });
@@ -918,7 +962,7 @@ bot.command("start", async (ctx) => {
     console.log(`⏱ /start TOTAL: ${Date.now() - t0}ms`);
 
   } catch (err) {
-    console.error("Error in /start:", err);
+    console.error("showMainMenu error:", err);
     await ctx.reply(
       `👋 Hai, *${esc(name)}\\!*\n` +
       `Yuk cek kondisi keuanganmu hari ini\\! 🔍\n\n` +
@@ -926,24 +970,49 @@ bot.command("start", async (ctx) => {
       { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
     );
   }
+}
+
+bot.command("start", async (ctx) => {
+  await Promise.all([
+    upsertUser(ctx.from.id, ctx.from.first_name || "Pengguna"),
+    clearSession(ctx.chat.id),
+  ]);
+  return showMainMenu(ctx);
 });
 
 async function handleSaldo(ctx) {
   await clearSession(ctx.chat.id);
-  const accounts = await getAccounts(ctx.from.id);
-  if (accounts.length === 0) return ctx.reply(`💳 Belum ada rekening tercatat\\.\n\nGunakan /tambahbank untuk menambahkan rekening pertamamu\\.`, { parse_mode: "MarkdownV2" });
+  const [accounts, wallets] = await Promise.all([getAccounts(ctx.from.id), getSolWallets(ctx.from.id)]);
+  if (!accounts.length && !wallets.length) return ctx.reply(`💳 Belum ada rekening atau wallet tercatat\\.\n\nGunakan /tambahbank atau buka Wallet Solana untuk menambahkan aset pertama\\.`, { parse_mode: "MarkdownV2" });
 
   let total = 0;
-  let text = `💰 *Saldo Rekening*\n\n`;
+  let text = `💼 *Saldo & Aset*\n\n`;
   for (const acc of accounts) {
     const icon = acc.balance >= 0 ? "🟢" : "🔴";
-    text += `${icon} *${esc(acc.bank_name)}*\n    ${esc(formatRupiah(acc.balance))}\n\n`;
+    text += `${icon} *${esc(acc.bank_name)}*\n└ *${esc(formatRupiah(acc.balance))}*\n\n`;
     total += acc.balance;
   }
-  text += `📊 *Total semua rekening*\n*${esc(formatRupiah(total))}*`;
+  if (wallets.length) {
+    const syncedWallets = wallets.filter((wallet) => wallet.last_balance_lamports !== null && wallet.last_balance_lamports !== undefined);
+    const totalLamports = syncedWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_lamports), 0n);
+    const solPrices = syncedWallets.length ? await getSolPrices() : null;
+    text += `🪙 *Wallet Solana*\n\n`;
+    for (const wallet of wallets) {
+      const balance = wallet.last_balance_lamports
+        ? formatSolEstimate(BigInt(wallet.last_balance_lamports), solPrices)
+        : "Belum disinkronkan";
+      text += `🟣 *${esc(wallet.label)}*\n├ \`${shortenSolAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
+    }
+    if (solPrices?.idr) {
+      const solValueIdr = Number(totalLamports) / 1_000_000_000 * solPrices.idr;
+      text += `📊 *Total Aset*\n└ *${esc(formatRupiah(total + solValueIdr))}*`;
+    }
+  } else if (accounts.length) {
+    text += `📊 *Total Aset*\n└ *${esc(formatRupiah(total))}*`;
+  }
   await ctx.reply(text, {
     parse_mode: "MarkdownV2",
-    reply_markup: createNavigationKeyboard(["✏️ Edit Rekening", "menu_editrekening"]),
+    reply_markup: createNavigationKeyboard(["✏️ Edit Rekening", "menu_editrekening"], ["🪙 Wallet Solana", "menu_wallet"]),
   });
 }
 
@@ -1456,11 +1525,8 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     if (data === "menu_start") {
-      const name = ctx.from.first_name || "Pengguna";
-      return ctx.reply(
-        `👋 *Halo, ${esc(name)}\\!*\n\nSelamat datang di *MyDuit Ku* 💰\n\nPilih menu di bawah ini:`,
-        { parse_mode: "MarkdownV2", reply_markup: startKeyboard }
-      );
+      await clearSession(chatId);
+      return showMainMenu(ctx);
     }
     if (data === "menu_saldo") return handleSaldo(ctx);
     if (data === "menu_catat") return handleCatat(ctx);
@@ -1498,7 +1564,7 @@ bot.on("callback_query:data", async (ctx) => {
 
   if (data === "wallet_add") {
     await saveSession(chatId, { step: "wallet_label" });
-    return ctx.reply("◎ *Tambah Wallet SOL*\n\nKetik nama wallet\\.\n_Contoh: Phantom Utama_", { parse_mode: "MarkdownV2" });
+    return ctx.reply("🪙 *Tambah Wallet Solana*\n\nBeri nama agar mudah dikenali\\.\n_Contoh: Phantom Utama_", { parse_mode: "MarkdownV2" });
   }
 
   if (data === "wallet_save") {
@@ -1508,9 +1574,9 @@ bot.on("callback_query:data", async (ctx) => {
       await clearSession(chatId);
       try {
         const lamports = await syncSolWallet(wallet);
-        return ctx.editMessageText(`✅ *Wallet SOL ditambahkan*\n\n${esc(wallet.label)}\n*${esc(formatSol(lamports))}*`, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["◎ Wallet SOL", "menu_wallet"]) });
+        return ctx.editMessageText(`✅ *Wallet berhasil ditambahkan*\n\n🪙 ${esc(wallet.label)}\n💰 *${esc(formatSol(lamports))}*`, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
       } catch {
-      return ctx.editMessageText("✅ Wallet disimpan\\. Sync awal gagal, coba sync lagi nanti\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["◎ Wallet SOL", "menu_wallet"]) });
+      return ctx.editMessageText("✅ Wallet disimpan\\. Sinkronisasi awal gagal, coba lagi nanti\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
       }
     } catch (error) {
       if (String(error.message).includes("UNIQUE")) return ctx.reply("⚠️ Wallet ini sudah dipantau\.", { parse_mode: "MarkdownV2" });
@@ -1522,7 +1588,7 @@ bot.on("callback_query:data", async (ctx) => {
     const walletId = parseCallbackId(data, "wallet_pick_");
     const wallet = walletId && await getSolWalletById(walletId, ctx.from.id);
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
-    return ctx.editMessageText(`◎ *${esc(wallet.label)}*\n\nAddress: ${esc(shortenSolAddress(wallet.address))}\nSaldo: *${esc(wallet.last_balance_lamports ? formatSol(wallet.last_balance_lamports) : "Belum disinkronkan")}*`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🔄 Sync Sekarang", `wallet_sync_${wallet.id}`).row().text("🏷 Ganti Nama", `wallet_rename_${wallet.id}`).text("🔗 Ganti Address", `wallet_address_${wallet.id}`).row().text("🗑 Hapus", `wallet_delete_${wallet.id}`).text("⬅️ Kembali", "menu_wallet") });
+    return ctx.editMessageText(formatWalletDetail(wallet), { parse_mode: "MarkdownV2", reply_markup: createWalletActions(wallet) });
   }
 
   if (data.startsWith("wallet_sync_")) {
@@ -1531,7 +1597,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
     try {
       const lamports = await syncSolWallet(wallet);
-      return ctx.editMessageText(`◎ *${esc(wallet.label)}*\n\nSaldo SOL: *${esc(formatSol(lamports))}*\nAddress: ${esc(shortenSolAddress(wallet.address))}`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🔄 Sync Lagi", `wallet_sync_${wallet.id}`).row().text("⬅️ Kembali", "menu_wallet") });
+      return ctx.editMessageText(formatWalletDetail({ ...wallet, last_balance_lamports: lamports }), { parse_mode: "MarkdownV2", reply_markup: createWalletActions(wallet) });
     } catch (error) {
       return ctx.reply("⚠️ Sync wallet gagal\. Saldo terakhir tetap disimpan\. Coba lagi nanti\.", { parse_mode: "MarkdownV2" });
     }
@@ -1542,7 +1608,7 @@ bot.on("callback_query:data", async (ctx) => {
     const wallet = walletId && await getSolWalletById(walletId, ctx.from.id);
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
     await saveSession(chatId, { step: "wallet_rename", walletId });
-    return ctx.reply("🏷 Ketik nama wallet baru\\.", { parse_mode: "MarkdownV2" });
+    return ctx.reply(`✏️ *Ganti Nama Wallet*\n\nKetik nama baru untuk *${esc(wallet.label)}*\\.`, { parse_mode: "MarkdownV2" });
   }
 
   if (data.startsWith("wallet_address_")) {
@@ -1550,7 +1616,7 @@ bot.on("callback_query:data", async (ctx) => {
     const wallet = walletId && await getSolWalletById(walletId, ctx.from.id);
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
     await saveSession(chatId, { step: "wallet_replace_address", walletId });
-    return ctx.reply("🔗 Kirim public address Solana baru\.\n\nHistori saldo address lama akan dihapus agar tidak tercampur\.", { parse_mode: "MarkdownV2" });
+    return ctx.reply(`🔗 *Ganti Public Address*\n\nKirim public address Solana baru untuk *${esc(wallet.label)}*\\.\n\n⚠️ Riwayat saldo address lama akan dihapus agar data tidak tercampur\\. Jangan pernah kirim seed phrase atau private key\\.`, { parse_mode: "MarkdownV2" });
   }
 
   if (data.startsWith("wallet_delete_confirm_")) {
@@ -1558,14 +1624,14 @@ bot.on("callback_query:data", async (ctx) => {
     const wallet = walletId && await getSolWalletById(walletId, ctx.from.id);
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
     await deleteSolWallet(wallet.id, ctx.from.id);
-    return ctx.editMessageText("✅ Wallet tidak lagi dipantau\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["◎ Wallet SOL", "menu_wallet"]) });
+    return ctx.editMessageText("✅ Wallet tidak lagi dipantau\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
   }
 
   if (data.startsWith("wallet_delete_")) {
     const walletId = parseCallbackId(data, "wallet_delete_");
     const wallet = walletId && await getSolWalletById(walletId, ctx.from.id);
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
-    return ctx.editMessageText(`⚠️ Hapus tracking wallet *${esc(wallet.label)}*?`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🗑 Hapus Wallet", `wallet_delete_confirm_${wallet.id}`).text("❌ Batal", "batal") });
+    return ctx.editMessageText(`⚠️ *Hapus wallet ini?*\n\n🪙 ${esc(wallet.label)}\n🔗 \`${shortenSolAddress(wallet.address)}\`\n\nTracking dan riwayat saldo akan dihapus\\.`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🗑 Ya, Hapus", `wallet_delete_confirm_${wallet.id}`).text("❌ Batal", "batal") });
   }
 
   if (data.startsWith("transfer_from_")) {
@@ -2244,7 +2310,7 @@ bot.on("message:text", async (ctx) => {
     sess.walletLabel = text;
     sess.step = "wallet_address";
     await saveSession(chatId, sess);
-    return ctx.reply("◎ Kirim *public address* Solana\\.\n\nJangan pernah kirim seed phrase atau private key\\.", { parse_mode: "MarkdownV2" });
+    return ctx.reply("🔗 Kirim *public address* Solana\\.\n\n⚠️ Jangan pernah kirim seed phrase atau private key\\.", { parse_mode: "MarkdownV2" });
   }
 
   if (sess.step === "wallet_address") {
@@ -2253,7 +2319,7 @@ bot.on("message:text", async (ctx) => {
     sess.walletAddress = address;
     sess.step = "wallet_confirm";
     await saveSession(chatId, sess);
-    return ctx.reply(`◎ *Konfirmasi Wallet SOL*\n\nNama: *${esc(sess.walletLabel)}*\nAddress: ${esc(shortenSolAddress(address))}`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✅ Simpan Wallet", "wallet_save").text("❌ Batal", "batal") });
+    return ctx.reply(`🪙 *Konfirmasi Wallet Solana*\n\n🏷 Nama\n*${esc(sess.walletLabel)}*\n\n🔗 Public Address\n\`${esc(address)}\``, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✅ Simpan Wallet", "wallet_save").text("❌ Batal", "batal") });
   }
 
   if (sess.step === "wallet_rename") {
@@ -2261,7 +2327,7 @@ bot.on("message:text", async (ctx) => {
     const updated = await renameSolWallet(sess.walletId, ctx.from.id, text);
     if (!updated) return ctx.reply("⚠️ Wallet tidak ditemukan\\. Buka daftar wallet lagi\\.", { parse_mode: "MarkdownV2" });
     await clearSession(chatId);
-    return ctx.reply("✅ Nama wallet diperbarui\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["◎ Wallet SOL", "menu_wallet"]) });
+    return ctx.reply("✅ Nama wallet diperbarui\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
   }
 
   if (sess.step === "wallet_replace_address") {
@@ -2273,7 +2339,7 @@ bot.on("message:text", async (ctx) => {
       const wallet = await getSolWalletById(sess.walletId, ctx.from.id);
       await clearSession(chatId);
       try { await syncSolWallet(wallet); } catch { }
-      return ctx.reply("✅ Address wallet diperbarui\. Saldo akan disinkronkan ulang\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["◎ Wallet SOL", "menu_wallet"]) });
+      return ctx.reply("✅ Address wallet diperbarui\\. Saldo sudah disinkronkan ulang\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
     } catch (error) {
       if (String(error.message).includes("UNIQUE")) return ctx.reply("⚠️ Address ini sudah dipantau\. Coba address lain\.", { parse_mode: "MarkdownV2" });
       throw error;
