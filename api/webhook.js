@@ -116,13 +116,17 @@ const startKeyboard = new InlineKeyboard()
   .text("📝 Catat Transaksi", "menu_catat").row()
   .text("↔️ Transfer", "menu_transfer")
   .text("📋 Riwayat", "menu_riwayat").row()
-  .text("🔮 Prediksi", "menu_prediksi").row()
+  .text("☰ Menu Lainnya", "menu_lainnya");
+
+const moreMenuKeyboard = new InlineKeyboard()
+  .text("🔮 Proyeksi Saldo", "menu_prediksi")
+  .text("📊 Laporan", "menu_laporan").row()
+  .text("📥 Export CSV", "menu_export")
+  .text("📸 Scan Screenshot", "menu_scan").row()
   .text("🏦 Tambah Rekening", "menu_tambahbank")
   .text("✏️ Edit Rekening", "menu_editrekening").row()
-  .text("📊 Laporan", "menu_laporan")
-  .text("📥 Export CSV", "menu_export").row()
-  .text("📸 Scan Screenshot", "menu_scan").row()
-  .text("⚙️ Pengaturan", "menu_settings");
+  .text("⚙️ Pengaturan", "menu_settings")
+  .text("🏠 Menu Utama", "menu_start");
 
 const pengaturanKeyboard = new InlineKeyboard()
   .text("🗑 Hapus Rekening", "menu_hapusbank").row()
@@ -1433,6 +1437,10 @@ bot.on("callback_query:data", async (ctx) => {
     if (data === "menu_laporan") return ctx.reply("📊 *Pilih Periode Laporan*", {
       parse_mode: "MarkdownV2",
       reply_markup: createReportKeyboard(),
+    });
+    if (data === "menu_lainnya") return ctx.reply("☰ *Menu Lainnya*\n\nFitur laporan, scan, rekening, dan pengaturan\.", {
+      parse_mode: "MarkdownV2",
+      reply_markup: moreMenuKeyboard,
     });
     if (data === "menu_export") return showExportMenu(ctx);
     if (data === "menu_settings") return ctx.reply("⚙️ *Pengaturan MyDuit Ku*", {
