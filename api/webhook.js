@@ -200,17 +200,18 @@ function parseCallbackId(data, prefix) {
   return Number.isSafeInteger(id) ? id : null;
 }
 
-async function handleTransfer(ctx) {
+async function handleTransfer(ctx, editMessage = false) {
   await clearSession(ctx.chat.id);
   const accounts = await getAccounts(ctx.from.id);
-  if (accounts.length < 2) return ctx.reply("↔️ Kamu butuh minimal dua rekening untuk transfer\.", {
+  const reply = editMessage ? ctx.editMessageText.bind(ctx) : ctx.reply.bind(ctx);
+  if (accounts.length < 2) return reply("↔️ Kamu butuh minimal dua rekening untuk transfer\\.", {
     parse_mode: "MarkdownV2",
     reply_markup: createNavigationKeyboard(["🏦 Tambah Rekening", "menu_tambahbank"]),
   });
   await saveSession(ctx.chat.id, { step: "transfer_from" });
   const kb = new InlineKeyboard();
   for (const account of accounts) kb.text(`🏦 ${account.bank_name} (${formatRupiah(account.balance)})`, `transfer_from_${account.id}`).row();
-  return ctx.reply("↔️ *Transfer Antar Rekening*\n\nPilih rekening sumber\.", { parse_mode: "MarkdownV2", reply_markup: kb });
+  return reply("↔️ *Transfer Antar Rekening*\n\nPilih rekening sumber\\.", { parse_mode: "MarkdownV2", reply_markup: kb });
 }
 
 async function sendTransferPreview(ctx, sess) {
@@ -1432,7 +1433,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
     if (data === "menu_saldo") return handleSaldo(ctx);
     if (data === "menu_catat") return handleCatat(ctx);
-    if (data === "menu_transfer") return handleTransfer(ctx);
+    if (data === "menu_transfer") return handleTransfer(ctx, true);
     if (data === "menu_riwayat") return handleRiwayat(ctx);
     if (data === "menu_prediksi") return handlePrediksi(ctx);
     if (data === "menu_tambahbank") return handleTambahBank(ctx);
