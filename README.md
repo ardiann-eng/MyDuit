@@ -1,4 +1,4 @@
-# 💰 MyDuit — Telegram Bot Tracking Keuangan
+# 💰 MyDuit Ku — Telegram Bot Tracking Keuangan
 
 Bot Telegram untuk mencatat saldo, pemasukan, dan pengeluaran pribadi.
 Dibangun dengan **Vercel** (serverless) + **Turso** (SQLite cloud) — 100% gratis.

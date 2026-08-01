@@ -7,8 +7,13 @@ import {
   getLastMonthTransactions,
   getAlertLogWithCooldown,
   logAlert,
+  getActiveSolWallets,
+  updateSolWalletBalance,
+  setSolWalletError,
+  insertSolSnapshot,
 } from "../lib/db.js";
 import { formatRupiah, esc } from "../lib/format.js";
+import { getNativeSolBalances, formatSol } from "../lib/solana.js";
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -22,10 +27,9 @@ export default async function handler(req, res) {
   try {
     await initDB();
     
-    const now = new Date();
-    // Convert to WIB (UTC+7)
-    const wibHour = (now.getUTCHours() + 7) % 24;
-    const wibDay = now.getUTCDate();
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Jakarta", hour: "2-digit", day: "2-digit", hourCycle: "h23" }).formatToParts(new Date());
+    const wibHour = Number(parts.find(part => part.type === "hour").value);
+    const wibDay = Number(parts.find(part => part.type === "day").value);
 
     // Detect which cron is running based on UTC hour and day
     const isMonthlyReport = wibDay === 1 && wibHour >= 7 && wibHour <= 9;
@@ -34,6 +38,7 @@ export default async function handler(req, res) {
     const users = await getAllUsers();
     
     const results = { sent: 0, skipped: 0, errors: 0 };
+    if (isDailyReminder) await syncDailySolWallets();
 
     for (const user of users) {
       try {
@@ -56,6 +61,33 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error("Cron error:", err);
     return res.status(200).json({ ok: false, error: err.message });
+  }
+}
+
+async function syncDailySolWallets() {
+  const wallets = await getActiveSolWallets();
+  const date = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit" })
+    .formatToParts(new Date()).reduce((result, part) => ({ ...result, [part.type]: part.value }), {});
+  const snapshotDate = `${date.year}-${date.month}-${date.day}`;
+  for (let offset = 0; offset < wallets.length; offset += 50) {
+    const chunk = wallets.slice(offset, offset + 50);
+    try {
+      const balances = await getNativeSolBalances(chunk.map(wallet => wallet.address));
+      for (const [index, wallet] of chunk.entries()) {
+        const lamports = balances[index];
+        const previous = wallet.last_balance_lamports;
+        await updateSolWalletBalance(wallet.id, lamports);
+        const inserted = await insertSolSnapshot(wallet.id, snapshotDate, lamports);
+        if (inserted && previous !== null && previous !== undefined && BigInt(previous) !== lamports) {
+          const delta = lamports - BigInt(previous);
+          const sign = delta > 0n ? "+" : "−";
+          await bot.api.sendMessage(wallet.telegram_id, `◎ *Perubahan Saldo SOL*\n\nWallet: *${esc(wallet.label)}*\nSaldo: *${esc(formatSol(lamports))}*\nPerubahan hari ini: *${esc(sign + formatSol(delta < 0n ? -delta : delta))}*`, { parse_mode: "MarkdownV2" }).catch(() => {});
+        }
+      }
+    } catch (error) {
+      for (const wallet of chunk) await setSolWalletError(wallet.id, error.message);
+      console.warn("Solana wallet sync failed:", error.message);
+    }
   }
 }
 
