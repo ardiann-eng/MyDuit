@@ -1,12 +1,13 @@
 // api/webhook.js
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import {
   initDB, upsertUser, addAccount, getAccounts,
-  getAccountById, deleteAccount, addTransaction,
+  getAccountById, deleteAccount, addTransaction, addTransactions, correctAccountBalance,
+  createTransfer, getTransactionById, deleteTransaction, deleteTransfer, updateTransactionNote, updateTransactionAmount,
   getRecentTransactions, addCustomCategory, getCustomCategories,
   getUserSettings, updateDailyLimit, getDailySpend, getWeeklySpend,
   logAlert, getTransactionsByDateRange,
-  getTransactionsForCurrentMonth, getTransactionsForCurrentWeek,
+  getTransactionsForCurrentMonth, getTransactionsForCurrentWeek, getTransactionsForMonth,
   getCategorySuggestions, upsertCategorySuggestion, updateSmartLimit,
   getAlertLogWithCooldown,
   getSessionData, setSessionData, clearSessionData,
@@ -113,17 +114,21 @@ const defaultIncomeSources = [
 const startKeyboard = new InlineKeyboard()
   .text("💰 Cek Saldo", "menu_saldo")
   .text("📝 Catat Transaksi", "menu_catat").row()
-  .text("📋 Riwayat", "menu_riwayat")
+  .text("↔️ Transfer", "menu_transfer")
+  .text("📋 Riwayat", "menu_riwayat").row()
   .text("🔮 Prediksi", "menu_prediksi").row()
   .text("🏦 Tambah Rekening", "menu_tambahbank")
   .text("✏️ Edit Rekening", "menu_editrekening").row()
-  .text("📊 Laporan Bulan Ini", "menu_laporan");
+  .text("📊 Laporan", "menu_laporan")
+  .text("📥 Export CSV", "menu_export").row()
+  .text("📸 Scan Screenshot", "menu_scan").row()
+  .text("⚙️ Pengaturan", "menu_settings");
 
 const pengaturanKeyboard = new InlineKeyboard()
   .text("🗑 Hapus Rekening", "menu_hapusbank").row()
   .text("➕ Tambah Kategori Custom", "menu_tambahkategori").row()
   .text("🎯 Set Limit Harian", "menu_setlimit").row()
-  .text("❌ Tutup", "menu_tutup");
+  .text("🏠 Menu Utama", "menu_start");
 
 // ── HELPER ────────────────────────────────────────────────────
 function parseNominal(text) {
@@ -135,6 +140,152 @@ function parseNominal(text) {
 
 function isValidNominal(val) {
   return !isNaN(val) && val > 0;
+}
+
+function median(values) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function percentile(values, p) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * p) - 1))];
+}
+
+function getWibDateKey(offsetDays = 0) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date());
+  const year = Number(parts.find((part) => part.type === "year").value);
+  const month = Number(parts.find((part) => part.type === "month").value) - 1;
+  const day = Number(parts.find((part) => part.type === "day").value);
+  return new Date(Date.UTC(year, month, day + offsetDays)).toISOString().slice(0, 10);
+}
+
+function getTransactionWibDateKey(createdAt) {
+  return new Date(`${createdAt.replace(' ', 'T')}Z`)
+    .toLocaleDateString("en-CA", { timeZone: "Asia/Jakarta" });
+}
+
+function createOperationId() {
+  return globalThis.crypto.randomUUID();
+}
+
+function createNavigationKeyboard(...actions) {
+  const keyboard = new InlineKeyboard();
+  for (const [label, callback] of actions) keyboard.text(label, callback);
+  if (actions.length > 1) keyboard.row();
+  return keyboard.text("🏠 Menu Utama", "menu_start");
+}
+
+function createReportKeyboard() {
+  return new InlineKeyboard()
+    .text("📅 Minggu Ini", "laporan_minggu")
+    .text("📊 Bulan Ini", "laporan_bulan").row()
+    .text("📥 Export CSV", "menu_export")
+    .text("🏠 Menu Utama", "menu_start");
+}
+
+function parseCallbackId(data, prefix) {
+  const raw = data.slice(prefix.length);
+  if (!/^[1-9]\d*$/.test(raw)) return null;
+  const id = Number(raw);
+  return Number.isSafeInteger(id) ? id : null;
+}
+
+async function handleTransfer(ctx) {
+  await clearSession(ctx.chat.id);
+  const accounts = await getAccounts(ctx.from.id);
+  if (accounts.length < 2) return ctx.reply("↔️ Kamu butuh minimal dua rekening untuk transfer\.", {
+    parse_mode: "MarkdownV2",
+    reply_markup: createNavigationKeyboard(["🏦 Tambah Rekening", "menu_tambahbank"]),
+  });
+  await saveSession(ctx.chat.id, { step: "transfer_from" });
+  const kb = new InlineKeyboard();
+  for (const account of accounts) kb.text(`🏦 ${account.bank_name} (${formatRupiah(account.balance)})`, `transfer_from_${account.id}`).row();
+  return ctx.reply("↔️ *Transfer Antar Rekening*\n\nPilih rekening sumber\.", { parse_mode: "MarkdownV2", reply_markup: kb });
+}
+
+async function sendTransferPreview(ctx, sess) {
+  const text = `↔️ *Konfirmasi Transfer*\n\n🏦 ${esc(sess.fromAccountName)}\n⬇️ *${esc(formatRupiah(sess.transferAmount))}*\n🏦 ${esc(sess.toAccountName)}\n⬆️ *${esc(formatRupiah(sess.transferAmount))}*${sess.transferNote ? `\n📝 _${esc(sess.transferNote)}_` : ""}`;
+  const kb = new InlineKeyboard()
+    .text("✅ Transfer", "transfer_save")
+    .text("✏️ Ubah Nominal", "transfer_edit_amount").row()
+    .text("📝 Ubah Catatan", "transfer_edit_note")
+    .text("❌ Batal", "batal");
+  return ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
+}
+
+function getYearMonth(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+}
+
+function formatExportMonth(yearMonth) {
+  const [year, month] = yearMonth.split("-").map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString("id-ID", {
+    month: "long",
+    year: "numeric",
+  });
+}
+
+function escapeCsvCell(value) {
+  let text = String(value ?? "").replace(/\r?\n/g, " ");
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function buildTransactionsCsv(txs) {
+  const header = ["Tanggal", "Jenis", "Nominal", "Rekening", "Kategori", "Sumber", "Keterangan"];
+  const rows = txs.map((tx) => [
+    tx.created_at,
+    tx.is_balance_correction ? "Koreksi saldo" : tx.is_transfer ? "Transfer" : tx.type === "masuk" ? "Pemasukan" : "Pengeluaran",
+    tx.amount,
+    tx.bank_name,
+    tx.category || "Lainnya",
+    tx.source || "",
+    tx.note || "",
+  ]);
+  return "\uFEFF" + [header, ...rows]
+    .map((row) => row.map(escapeCsvCell).join(","))
+    .join("\r\n");
+}
+
+function createExportKeyboard() {
+  const keyboard = new InlineKeyboard().text("📥 Export Bulan Ini", "export_csv_current").row();
+  const now = new Date();
+  for (let offset = 1; offset < 6; offset++) {
+    const date = new Date(now.getFullYear(), now.getMonth() - offset, 1);
+    const yearMonth = getYearMonth(date);
+    keyboard.text(formatExportMonth(yearMonth), `export_csv_${yearMonth}`).row();
+  }
+  return keyboard;
+}
+
+async function showExportMenu(ctx) {
+  await clearSession(ctx.chat.id);
+  return ctx.reply("📥 *Export Transaksi CSV*\n\nPilih periode transaksi untuk diunduh\\.", {
+    parse_mode: "MarkdownV2",
+    reply_markup: createExportKeyboard(),
+  });
+}
+
+async function exportTransactionsCsv(ctx, yearMonth) {
+  const txs = await getTransactionsForMonth(ctx.from.id, yearMonth);
+  const monthLabel = formatExportMonth(yearMonth);
+
+  if (txs.length === 0) {
+    return ctx.reply(`📥 Belum ada transaksi pada ${esc(monthLabel)}\\.`, { parse_mode: "MarkdownV2" });
+  }
+
+  const filename = `myduit-transaksi-${yearMonth}.csv`;
+  await ctx.replyWithDocument(new InputFile(Buffer.from(buildTransactionsCsv(txs), "utf8"), filename), {
+    caption: `📥 Export ${monthLabel}: ${txs.length} transaksi.`,
+  });
 }
 
 // ── SCORE CALCULATION ──────────────────────────────────────────
@@ -230,18 +381,10 @@ async function calculateScore(telegramId, dailyLimit, prefetchedData = null) {
     let factor4 = 0;
     let savingRate = 0;
 
-    const txsLast30 = prefetchedData?.thisMonthTxs
-      ? [] // skip if we already have monthly data from prefetch
-      : await Promise.all([
-        getTransactionsByDateRange(telegramId, 'masuk', 30),
-        getTransactionsByDateRange(telegramId, 'keluar', 30),
-      ]).then(([masuk, keluar]) => [...masuk, ...keluar]);
-
-    // Then merge with thisMonthTxs from prefetchedData or txList:
-    const allTxsForSaving = [
-      ...(prefetchedData?.thisMonthTxs || thisMonthTxs || []),
-      ...txsLast30,
-    ];
+    const allTxsForSaving = await Promise.all([
+      getTransactionsByDateRange(telegramId, 'masuk', 30),
+      getTransactionsByDateRange(telegramId, 'keluar', 30),
+    ]).then(([masuk, keluar]) => [...masuk, ...keluar]);
 
     // Deduplicate by id:
     const seenIds = new Set();
@@ -300,12 +443,13 @@ function computeLimitFromData(settings, accounts) {
     return settings.daily_limit;
   }
   const totalBalance = accounts.reduce((acc, a) => acc + a.balance, 0);
-  let dailyLimit = totalBalance * 0.20;
+  let dailyLimit = totalBalance > 0 ? totalBalance * 0.20 : 0;
   if (settings?.monthly_income > 0) {
     const incomeBasedLimit = (settings.monthly_income * 0.70) / 30;
-    dailyLimit = Math.min(dailyLimit, incomeBasedLimit);
+    dailyLimit = dailyLimit > 0 ? Math.min(dailyLimit, incomeBasedLimit) : incomeBasedLimit;
+    return Math.round(dailyLimit / 100) * 100;
   }
-  if (dailyLimit < 10000) dailyLimit = 10000;
+  if (dailyLimit > 0 && dailyLimit < 10000) dailyLimit = 10000;
   return Math.round(dailyLimit / 100) * 100;
 }
 // ── OCR: EXTRACT TEXT FROM IMAGE ──────────────────────────────
@@ -357,7 +501,11 @@ function parseTransactionFromText(text) {
   while ((match = nominalRegex.exec(text)) !== null) {
     const raw = match[1].replace(/\./g, '').replace(',', '.');
     const nominal = parseFloat(raw);
-    if (!isNaN(nominal) && nominal >= 1000) {
+    const lineStart = text.lastIndexOf('\n', match.index) + 1;
+    const lineEnd = text.indexOf('\n', match.index);
+    const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd).toLowerCase();
+    const isNonTransactionValue = /\b(saldo|total|subtotal|biaya|admin|limit|referensi|ref\.?|nomor rekening)\b/.test(line);
+    if (!isNaN(nominal) && nominal >= 1000 && !isNonTransactionValue) {
       nominalMatches.push({ nominal, index: match.index });
     }
   }
@@ -484,15 +632,19 @@ async function showOcrKonfirmasi(ctx, sess, accounts) {
   const typeIcon = tx.type === "masuk" ? "⬆️" : "⬇️";
   const typeLabel = tx.type === "masuk" ? "Pemasukan" : "Pengeluaran";
 
-  let text = `📸 *Transaksi ${i + 1} dari ${list.length}*\n──────────────────\n`;
+  let text = `📸 *Transaksi ${i + 1} dari ${list.length}*\n\n`;
   text += `${esc(typeIcon)} Jenis    : *${esc(typeLabel)}*\n`;
   text += `💰 Nominal  : *${esc(formatRupiah(tx.nominal))}*\n`;
   if (tx.merchant) text += `🏪 Merchant : *${esc(tx.merchant)}*\n`;
-  if (tx.date) text += `📅 Tanggal  : *${esc(tx.date)}*\n`;
   text += `📂 Kategori : *${esc(tx.category)}*\n`;
-  text += `──────────────────\nSimpan ke rekening mana?`;
+  text += `\nPeriksa detail sebelum simpan\\.`;
 
   const kb = new InlineKeyboard();
+  if (tx.type === "keluar") {
+    kb.text("🏷 Ubah Kategori", "ocr_ubah_kategori").row();
+  }
+  kb.text("✏️ Ubah Nominal", "ocr_ubah_nominal")
+    .text("↕️ Ubah Jenis", "ocr_ubah_jenis").row();
   for (const acc of accounts) {
     kb.text(`🏦 ${acc.bank_name}`, `ocr_simpan1_${acc.id}`).row();
   }
@@ -628,7 +780,7 @@ async function analyzeAndAlert(ctx, telegramId) {
       ? Math.max(0, Math.round(dailyLimit) - todaySpend)
       : 0;
 
-    let msg = `📊 *Analisis Transaksi*\n─────────────────\n`;
+    let msg = `📊 *Analisis Transaksi*\n\n`;
     msg += `🏦 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n\n`;
     msg += `💸 Pengeluaran hari ini: *${esc(formatRupiah(todaySpend))}*\n`;
     msg += `🎯 Limit harian: ${esc(limitDisplay)}\n`;
@@ -748,14 +900,17 @@ async function handleSaldo(ctx) {
   if (accounts.length === 0) return ctx.reply(`💳 Belum ada rekening tercatat\\.\n\nGunakan /tambahbank untuk menambahkan rekening pertamamu\\.`, { parse_mode: "MarkdownV2" });
 
   let total = 0;
-  let text = `💰 *Saldo Rekening MyDuit Ku*\n─────────────────────\n`;
+  let text = `💰 *Saldo Rekening*\n\n`;
   for (const acc of accounts) {
     const icon = acc.balance >= 0 ? "🟢" : "🔴";
     text += `${icon} *${esc(acc.bank_name)}*\n    ${esc(formatRupiah(acc.balance))}\n\n`;
     total += acc.balance;
   }
-  text += `─────────────────────\n📊 *Total Semua Rekening*\n*${esc(formatRupiah(total))}*`;
-  await ctx.reply(text, { parse_mode: "MarkdownV2" });
+  text += `📊 *Total semua rekening*\n*${esc(formatRupiah(total))}*`;
+  await ctx.reply(text, {
+    parse_mode: "MarkdownV2",
+    reply_markup: createNavigationKeyboard(["✏️ Edit Rekening", "menu_editrekening"]),
+  });
 }
 
 async function handleRiwayat(ctx) {
@@ -775,7 +930,7 @@ async function handleRiwayat(ctx) {
   const totalSaldo = accounts.reduce((sum, a) => sum + a.balance, 0);
 
   // Build transaction list with date grouping
-  let text = `📋 *10 Transaksi Terakhir*\n──────────────────────\n\n`;
+  let text = `📋 *10 Transaksi Terakhir*\n\n`;
   let lastDate = null;
 
   for (const tx of txs) {
@@ -792,9 +947,9 @@ async function handleRiwayat(ctx) {
     }
 
     // Transaction format
-    const icon = tx.type === "masuk" ? "⬆️" : "⬇️";
+    const icon = tx.is_transfer ? "↔️" : tx.type === "masuk" ? "⬆️" : "⬇️";
     const sign = tx.type === "masuk" ? "\\+" : "\\-";
-    const label = tx.type === "masuk" ? (tx.source || "Lainnya") : (tx.category || "Lainnya");
+    const label = tx.is_transfer ? "Transfer antar rekening" : tx.type === "masuk" ? (tx.source || "Lainnya") : (tx.category || "Lainnya");
 
     text += `${icon} ${sign}${esc(formatRupiah(tx.amount))} • ${esc(label)}\n`;
     text += `🏦 ${esc(tx.bank_name)}`;
@@ -818,13 +973,18 @@ async function handleRiwayat(ctx) {
     ? formatRupiah(Math.round(dailyLimit))
     : "Belum diatur";
 
-  text += `──────────────────────\n`;
   text += `📊 *Pengeluaran Hari Ini*\n`;
   text += `\`${esc(barStr)}\` ${esc(pct.toString())}\\% dari limit harian\n`;
   text += `💸 ${esc(formatRupiah(todaySpend))} / ${esc(limitDisplay)}\n`;
   text += `🏦 Sisa Saldo: *${esc(formatRupiah(totalSaldo))}*`;
 
-  await ctx.reply(text, { parse_mode: "MarkdownV2" });
+  const historyKeyboard = new InlineKeyboard();
+  for (const tx of txs) historyKeyboard.text(`Kelola ${formatRupiah(tx.amount)}`, `tx_manage_${tx.id}`).row();
+  historyKeyboard.text("📝 Catat", "menu_catat").text("🏠 Menu Utama", "menu_start");
+  await ctx.reply(text, {
+    parse_mode: "MarkdownV2",
+    reply_markup: historyKeyboard,
+  });
 }
 
 async function handleHapusBank(ctx) {
@@ -845,7 +1005,7 @@ async function handleTambahBank(ctx) {
   const sess = {};
   sess.step = "tambahbank_nama";
   await saveSession(ctx.chat.id, sess);
-  await ctx.reply(`🏦 *Tambah Rekening Baru*\n\nKetik nama bank atau dompet digitalmu\\.\n_Contoh: BCA, Mandiri, GoPay, Dana_`, { parse_mode: "MarkdownV2" });
+  await ctx.reply(`🏦 *Tambah Rekening Baru*\n\nKetik nama rekeningmu\\.\n_Contoh: BCA, GoPay, Cash_`, { parse_mode: "MarkdownV2" });
 }
 
 async function handleEditRekening(ctx) {
@@ -879,7 +1039,7 @@ async function handleTambahKategori(ctx) {
   const sess = {};
   sess.step = "tambahkategori_nama";
   await saveSession(ctx.chat.id, sess);
-  await ctx.reply(`🏷 *Tambah Kategori Baru*\n\nKetik nama kategori pengeluaran kustom Anda beserta emojinya \\(opsional\\)\\.\n_Contoh: 🐶 Peliharaan_`, { parse_mode: "MarkdownV2" });
+  await ctx.reply(`🏷 *Tambah Kategori Baru*\n\nKetik nama kategori pengeluaran beserta emoji \(opsional\)\.\n_Contoh: 🐶 Peliharaan_`, { parse_mode: "MarkdownV2" });
 }
 bot.command("tambahkategori", handleTambahKategori);
 
@@ -902,127 +1062,70 @@ async function handlePrediksi(ctx) {
   const txs = await getTransactionsByDateRange(ctx.from.id, 'keluar', 30);
   if (txs.length === 0) return ctx.reply(`🔮 Belum ada data pengeluaran 30 hari terakhir\\.`, { parse_mode: "MarkdownV2" });
 
-  // Parallelize independent DB reads
-  const [accounts, settings, todaySpend, thisMonthTxs, thisWeek, lastWeek] =
-    await Promise.all([
-      getAccounts(ctx.from.id),
-      getUserSettings(ctx.from.id),
-      getDailySpend(ctx.from.id),
-      getTransactionsForCurrentMonth(ctx.from.id),
-      getWeeklySpend(ctx.from.id, 0),
-      getWeeklySpend(ctx.from.id, 1),
-    ]);
-  const smartDailyLimit = computeLimitFromData(settings, accounts);
-  updateSmartLimit(ctx.from.id, smartDailyLimit).catch(() => { });
+  const activeDays = new Set(txs.map((tx) => getTransactionWibDateKey(tx.created_at))).size;
+  if (activeDays < 7) {
+    return ctx.reply("🔮 *Data belum cukup untuk prediksi*\n\nCatat transaksi pada setidaknya 7 hari berbeda agar prediksi lebih masuk akal\\.", {
+      parse_mode: "MarkdownV2",
+      reply_markup: createNavigationKeyboard(["📝 Catat Transaksi", "menu_catat"]),
+    });
+  }
 
-  let total30 = 0, last7 = 0, prev7 = 0;
+  const accounts = await getAccounts(ctx.from.id);
+  const totalBalance = accounts.reduce((sum, account) => sum + account.balance, 0);
+  const spendByDay = new Map();
   const categoryMap = new Map();
-  const now = new Date();
-
-  // BUG FIX 3: Use date-only comparison to avoid timezone ambiguity
-  // created_at is WIB localtime, append "Z" causes 7-hour offset
-  const nowWIB = new Date(now.getTime() + (7 * 60 * 60 * 1000));
-  const todayStr = nowWIB.toISOString().split('T')[0]; // "YYYY-MM-DD"
-  const todayDateOnly = new Date(todayStr);
-
   for (const tx of txs) {
-    total30 += tx.amount;
-    const cat = tx.category || "Lainnya";
-    categoryMap.set(cat, (categoryMap.get(cat) || 0) + tx.amount);
-
-    // BUG FIX 3: Compare only date part (no time, no timezone)
-    const txDateStr = tx.created_at.split(' ')[0]; // "YYYY-MM-DD"
-    const txDateOnly = new Date(txDateStr);
-    const diffDays = Math.floor((todayDateOnly - txDateOnly) / (1000 * 60 * 60 * 24));
-
-    if (diffDays < 7) last7 += tx.amount;
-    else if (diffDays >= 7 && diffDays < 14) prev7 += tx.amount;
+    const date = getTransactionWibDateKey(tx.created_at);
+    spendByDay.set(date, (spendByDay.get(date) || 0) + tx.amount);
+    const category = tx.category || "Lainnya";
+    categoryMap.set(category, (categoryMap.get(category) || 0) + tx.amount);
   }
 
-  // BUG FIX 2: Calculate avg30 by actual days since oldest transaction
-  // txs is sorted DESC, so oldest tx is at the end
-  const oldestTx = txs[txs.length - 1];
-  const oldestDate = new Date(oldestTx.created_at.replace(' ', 'T'));
-  const actualDays = Math.max(1, Math.round((now - oldestDate) / (1000 * 60 * 60 * 24)));
-  const effectiveDays = Math.min(30, actualDays);
-  const avg30 = total30 / effectiveDays;
-  const last7Avg = last7 / 7;
-  const prev7Avg = prev7 / 7;
-
-  let trendStr = "stabil";
-  let trendEmoji = "➖";
-  let multiplier = 1.0;
-  if (prev7Avg > 0) {
-    if (last7Avg > prev7Avg) { trendStr = "meningkat"; trendEmoji = "📈"; multiplier = 1.1; }
-    else if (last7Avg < prev7Avg) { trendStr = "menurun"; trendEmoji = "📉"; multiplier = 0.9; }
-  }
-
-  const totalBalance = accounts.reduce((sum, acc) => sum + acc.balance, 0);
-  const totalInitialBalance = accounts.reduce((acc, a) => acc + (a.initial_balance || 0), 0);
-
-  // BUG FIX 1: Use actual daily average (avg30) instead of smartDailyLimit
-  // smartDailyLimit = totalBalance * 0.20, so always results in 5 days
-  const daysUntilEmpty = avg30 > 0 ? Math.floor(totalBalance / avg30) : 999;
-  const predictedDate = new Date();
-  predictedDate.setDate(predictedDate.getDate() + daysUntilEmpty);
-
+  const dailySpend = Array.from({ length: 30 }, (_, index) => spendByDay.get(getWibDateKey(-index)) || 0);
+  const activeDailySpend = dailySpend.filter((amount) => amount > 0);
+  const p90 = percentile(activeDailySpend, 0.9);
+  const winsorizedDaily = dailySpend.map((amount) => Math.min(amount, p90));
+  const robustDaily = winsorizedDaily.reduce((sum, amount) => sum + amount, 0) / 30;
+  const recentDaily = dailySpend.slice(0, 7).reduce((sum, amount) => sum + amount, 0) / 7;
+  const priorDaily = dailySpend.slice(7, 30).reduce((sum, amount) => sum + amount, 0) / 23;
+  const trendFactor = priorDaily > 0 ? Math.max(0.8, Math.min(1.2, recentDaily / priorDaily)) : 1;
+  const normalDaily = Math.round((robustDaily * 0.7 + median(activeDailySpend) * (activeDays / 30) * 0.3) * trendFactor);
+  const scenarios = [
+    { label: "Hemat", daily: Math.round(normalDaily * 0.8) },
+    { label: "Normal", daily: normalDaily },
+    { label: "Boros", daily: Math.round(normalDaily * 1.25) },
+  ];
+  const variation = median(activeDailySpend) > 0 ? p90 / median(activeDailySpend) : 1;
+  const confidence = activeDays >= 20 && variation <= 2 ? "tinggi" : activeDays >= 12 && variation <= 4 ? "sedang" : "rendah";
   const sortedCats = Array.from(categoryMap.entries()).sort((a, b) => b[1] - a[1]);
+  const normalRunway = normalDaily > 0 ? Math.floor(totalBalance / normalDaily) : 0;
 
-  // Create prefetched data for calculateScore
-  const prefetchedData = {
-    todaySpend,
-    accounts,
-    thisMonthTxs,
-    thisWeek,
-    lastWeek,
-  };
-
-  // Calculate Score with prefetched data (no redundant DB calls)
-  const scorecard = await calculateScore(ctx.from.id, smartDailyLimit, prefetchedData);
-  const { score, scoreEmoji: scoreEmojiBase } = scorecard;
-  let scoreEmoji = "🔴";
-  if (score >= 90) scoreEmoji = "💚";
-  else if (score >= 70) scoreEmoji = "🟡";
-  else if (score >= 50) scoreEmoji = "🟠";
-
-  // Compute saving rate from already-fetched thisMonthTxs
-  let monthIncome = 0;
-  let monthSpend = 0;
-  for (const tx of thisMonthTxs) {
-    if (tx.type === "masuk") monthIncome += tx.amount;
-    else monthSpend += tx.amount;
+  let text = `📈 *Proyeksi Saldo*\n\n`;
+  text += `💰 Saldo saat ini: *${esc(formatRupiah(totalBalance))}*\n`;
+  text += `💸 Belanja harian normal: *${esc(formatRupiah(normalDaily))}*\n`;
+  text += `📊 Keyakinan: *${esc(confidence)}* \\(${esc(activeDays.toString())} hari aktif dari 30 hari\\)\n\n`;
+  text += `*30 hari ke depan*\n`;
+  for (const scenario of scenarios) {
+    const projected = totalBalance - scenario.daily * 30;
+    text += `${esc(scenario.label)}: *${esc(formatRupiah(projected))}*\n`;
   }
-  let savingRate = 0;
-  if (monthIncome > 0) {
-    savingRate = (monthIncome - monthSpend) / monthIncome;
+  text += `\n*60 hari ke depan*\n`;
+  for (const scenario of scenarios) {
+    const projected = totalBalance - scenario.daily * 60;
+    text += `${esc(scenario.label)}: *${esc(formatRupiah(projected))}*\n`;
   }
-
-  let advice = "Catat setiap transaksi untuk analisis yang lebih akurat.";
-  if (score < 50) advice = "Kondisi keuanganmu kritis. Tunda pengeluaran non-esensial.";
-  else if (score < 70 && trendStr === "meningkat") advice = "Belanjamu meningkat pesat. Coba terapkan aturan 50/30/20.";
-  else if (smartDailyLimit > 0 && todaySpend > smartDailyLimit) advice = "Limit harian terlampaui. Hindari pengeluaran sampai besok.";
-  else if (totalInitialBalance > 0 && (totalBalance / totalInitialBalance) < 0.25) advice = "Saldo tinggal 25%. Prioritaskan kebutuhan pokok saja.";
-  else if (savingRate > 0.3) advice = "Hebat! Tabunganmu bulan ini di atas 30%. Pertahankan!";
-  else if (smartDailyLimit > 0 && (todaySpend / smartDailyLimit) < 0.5 && score > 80) advice = "Pengeluaran terkendali. Keuanganmu sehat hari ini.";
-
-  let text = `🔮 *Prediksi Keuangan MyDuit Ku*\n─────────────────\n`;
-  text += `💰 Total saldo: *${esc(formatRupiah(totalBalance))}*\n`;
-  text += `💸 Rata\\-rata harian: *${esc(formatRupiah(avg30))}*\n`;
-  text += `📈 Tren: *${esc(trendStr)}* ${esc(trendEmoji)}\n\n`;
-
-  text += `📅 Estimasi saldo habis:\n*${esc(predictedDate.toLocaleDateString("id-ID", { day: "2-digit", month: "long", year: "numeric" }))}* \\(${esc(daysUntilEmpty.toString())} hari lagi\\)\n\n`;
-
-  text += `🏆 *Top 3 Pengeluaran Bulan Ini:*\n`;
-  for (let i = 0; i < Math.min(3, sortedCats.length); i++) {
-    const [name, amt] = sortedCats[i];
-    const pct = Math.round((amt / total30) * 100);
-    text += `${i + 1}\\. ${esc(name)} — ${esc(formatRupiah(amt))} \\(${esc(pct.toString())}%\\)\n`;
+  text += `\n*90 hari ke depan*\n`;
+  for (const scenario of scenarios) {
+    const projected = totalBalance - scenario.daily * 90;
+    text += `${esc(scenario.label)}: *${esc(formatRupiah(projected))}*\n`;
   }
-
-  text += `\n🎯 Skor Kesehatan: *${esc(score.toString())}/100* ${esc(scoreEmoji)}\n`;
-  text += `💡 _${esc(advice)}_`;
-
-  await ctx.reply(text, { parse_mode: "MarkdownV2" });
+  text += `\n📅 Dengan pola normal, saldo cukup sekitar *${esc(normalRunway.toString())} hari*\\.`;
+  text += `\n_Proyeksi belum memasukkan pemasukan atau tagihan masa depan karena belum ada jadwal yang dicatat\\._`;
+  if (sortedCats.length) {
+    const [topCategory, topAmount] = sortedCats[0];
+    text += `\n\nPengeluaran terbesar: *${esc(topCategory)}* \\(${esc(formatRupiah(topAmount))}\\)`;
+  }
+  await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📝 Catat", "menu_catat"]) });
 }
 
 async function generateReport(ctx, isMonthly) {
@@ -1030,7 +1133,10 @@ async function generateReport(ctx, isMonthly) {
   const telegramId = ctx.from.id;
   const txs = isMonthly ? await getTransactionsForCurrentMonth(telegramId) : await getTransactionsForCurrentWeek(telegramId);
 
-  if (txs.length === 0) return ctx.reply(`📊 Belum ada transaksi untuk periode ini\\.`, { parse_mode: "MarkdownV2" });
+  if (txs.length === 0) return ctx.reply(`📊 Belum ada transaksi untuk periode ini\\.`, {
+    parse_mode: "MarkdownV2",
+    reply_markup: createNavigationKeyboard(["📝 Catat Transaksi", "menu_catat"]),
+  });
 
   let totalIn = 0, totalOut = 0;
   const cats = new Map();
@@ -1074,28 +1180,32 @@ async function generateReport(ctx, isMonthly) {
   else if (savingRate > 0.1) msgAdvice = "Cukup baik, tapi kamu masih bisa lebih efisien!";
   else if (savingRate < 0) msgAdvice = "Pengeluaran membengkak dari pemasukan. Segera perbaiki keuanganmu!";
 
-  let text = `📊 *Laporan ${title} MyDuit Ku*\n`;
-  text += `Periode: ${esc(formatDate(periodStart.toISOString().split('T')[0]))} \\- ${esc(formatDate(periodEnd.toISOString().split('T')[0]))}\n─────────────────\n`;
+  const periodLabel = isMonthly
+    ? new Intl.DateTimeFormat("id-ID", { timeZone: "Asia/Jakarta", month: "long", year: "numeric" }).format(new Date())
+    : "minggu ini";
+  let text = `📊 *Laporan ${esc(periodLabel)}*\n`;
+  text += `Transaksi tercatat: ${esc(formatDate(periodStart.toISOString().split('T')[0]))} \\- ${esc(formatDate(periodEnd.toISOString().split('T')[0]))}\n\n`;
   text += `💰 Pemasukan:    *${esc(formatRupiah(totalIn))}*\n`;
   text += `💸 Pengeluaran:  *${esc(formatRupiah(totalOut))}*\n`;
   text += `📈 Selisih:      *${esc(formatRupiah(diff))}*\n`;
   const svPct = Math.round(savingRate * 100);
-  text += `💾 Saving rate:  *${esc(svPct.toString())}%*\n\n`;
+  text += `💾 Tingkat tabungan: *${esc(svPct.toString())}%*\n\n`;
 
   if (cats.size > 0) {
-    text += `📂 *Per Kategori:*\n`;
+    text += `📂 *Pengeluaran terbesar*\n`;
     const sortedCats = Array.from(cats.entries()).sort((a, b) => b[1] - a[1]);
-    for (const [name, amt] of sortedCats) {
+    for (const [name, amt] of sortedCats.slice(0, 5)) {
       const pct = Math.round((amt / totalOut) * 100);
       text += `• ${esc(name)}    ${esc(formatRupiah(amt))} \\(${esc(pct.toString())}%\\)\n`;
     }
+    if (sortedCats.length > 5) text += `• \+${esc((sortedCats.length - 5).toString())} kategori lainnya\n`;
     text += `\n`;
   }
 
-  text += `🎯 Skor Rata\\-rata: *${esc(score.toString())}/100*\n`;
+  text += `🎯 Skor kesehatan saat ini: *${esc(score.toString())}/100*\n`;
   text += `💡 _${esc(msgAdvice)}_`;
 
-  await ctx.reply(text, { parse_mode: "MarkdownV2" });
+  await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📥 Export CSV", "menu_export"]) });
 }
 
 // ── COMMAND BINDINGS ──────────────────────────────────────────
@@ -1104,6 +1214,8 @@ bot.hears("💰 Saldo", handleSaldo);
 
 bot.command("catat", handleCatat);
 bot.hears("📝 Catat", handleCatat);
+
+bot.command("transfer", handleTransfer);
 
 bot.command("riwayat", handleRiwayat);
 bot.hears("📋 Riwayat", handleRiwayat);
@@ -1114,6 +1226,7 @@ bot.hears("🔮 Prediksi", handlePrediksi);
 bot.command("laporanminggu", (ctx) => generateReport(ctx, false));
 bot.command("laporanbulan", (ctx) => generateReport(ctx, true));
 bot.hears("📊 Laporan", (ctx) => generateReport(ctx, true));
+bot.command("exportcsv", showExportMenu);
 
 bot.hears("➕ Tambah Kategori", handleTambahKategori);
 
@@ -1156,6 +1269,7 @@ async function sendCatatPreview(ctx, sess) {
   }
 
   sess.step = "catat_konfirmasi";
+  sess.operationId = createOperationId();
   await saveSession(ctx.chat.id, sess);
 
   const labelKategori = sess.type === "masuk"
@@ -1165,19 +1279,15 @@ async function sendCatatPreview(ctx, sess) {
   const icon = sess.type === "masuk" ? "⬆️ Pemasukan" : "⬇️ Pengeluaran";
 
   const text =
-    `🔍 *Konfirmasi Transaksi*\n` +
-    `──────────────────\n` +
-    `🏦 Rekening : *${esc(sess.accountName)}*\n` +
-    `📂 Jenis    : *${esc(icon)}*\n` +
-    `🏷 Kategori : *${esc(labelKategori)}*\n` +
-    `💵 Nominal  : *${esc(formatRupiah(sess.amount))}*\n` +
-    `📝 Keterangan: ${noteCat}\n` +
-    `──────────────────\n` +
-    `Pastikan data sudah benar sebelum menyimpan\\.`;
+    `${esc(icon)} · *${esc(formatRupiah(sess.amount))}*\n\n` +
+    `🏷 ${esc(labelKategori)}\n` +
+    `🏦 ${esc(sess.accountName)}\n` +
+    `📝 ${noteCat}\n\n` +
+    `Periksa detail sebelum menyimpan\\.`;
 
   const kb = new InlineKeyboard()
     .text("✅ Simpan", "catat_simpan")
-    .text("✏️ Ubah Nominal", "catat_ubah_nominal").row()
+    .text("✏️ Ubah Detail", "catat_ubah_detail").row()
     .text("❌ Batal", "batal");
 
   if (ctx.callbackQuery) {
@@ -1232,25 +1342,28 @@ bot.on("message:photo", async (ctx) => {
     // Simpan semua transaksi ke session
     const sess = {};
     sess.step = "ocr_pilih_rekening";
+    sess.ocrOperationId = createOperationId();
     sess.ocrList = parsedList;         // array semua transaksi
     sess.ocrIndex = 0;                 // index yang sedang dikonfirmasi
     await saveSession(ctx.chat.id, sess);
 
-    // Tampilkan ringkasan semua transaksi yang ditemukan
-    let summary = `📸 *Ditemukan ${parsedList.length} Transaksi*\n──────────────────\n`;
+    // Tampilkan draft. Bulk save always requires explicit second confirmation.
+    let summary = `📸 *Draf ${parsedList.length} Transaksi*\n\n`;
     parsedList.forEach((tx, i) => {
       const icon = tx.type === "masuk" ? "⬆️" : "⬇️";
-      summary += `${i + 1}\\. ${esc(icon)} *${esc(formatRupiah(tx.nominal))}*`;
-      if (tx.merchant) summary += ` — ${esc(tx.merchant)}`;
+      const typeLabel = tx.type === "masuk" ? "Pemasukan" : "Pengeluaran";
+      summary += `${i + 1}\\. ${esc(icon)} *${esc(formatRupiah(tx.nominal))}* — ${esc(typeLabel)}\n`;
+      summary += `   ${esc(tx.category || "Lainnya")}`;
+      if (tx.merchant) summary += ` · ${esc(tx.merchant)}`;
       summary += `\n`;
     });
-    summary += `──────────────────\nSimpan semua ke rekening mana?`;
+    summary += `\nPilih rekening untuk meninjau atau simpan\\.`;
 
     const kb = new InlineKeyboard();
     for (const acc of accounts) {
-      kb.text(`🏦 ${acc.bank_name} (${formatRupiah(acc.balance)})`, `ocr_bulk_${acc.id}`).row();
+      kb.text(`🏦 Tinjau untuk ${acc.bank_name}`, `ocr_bulk_${acc.id}`).row();
     }
-    kb.text("📝 Konfirmasi Satu per Satu", "ocr_satu_satu").row();
+    kb.text("📝 Edit Satu per Satu", "ocr_satu_satu").row();
     kb.text("❌ Batal", "batal");
 
     await ctx.reply(summary, { parse_mode: "MarkdownV2", reply_markup: kb });
@@ -1296,7 +1409,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (data === "menu_tutup") {
       await ctx.deleteMessage().catch(() => { });
     } else {
-      await ctx.editMessageText("❌ Transaksi dibatalkan\\.", { parse_mode: "MarkdownV2" });
+      await ctx.editMessageText("❌ Proses dibatalkan\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard() });
     }
     return;
   }
@@ -1313,15 +1426,121 @@ bot.on("callback_query:data", async (ctx) => {
     }
     if (data === "menu_saldo") return handleSaldo(ctx);
     if (data === "menu_catat") return handleCatat(ctx);
+    if (data === "menu_transfer") return handleTransfer(ctx);
     if (data === "menu_riwayat") return handleRiwayat(ctx);
     if (data === "menu_prediksi") return handlePrediksi(ctx);
     if (data === "menu_tambahbank") return handleTambahBank(ctx);
-    if (data === "menu_laporan") return generateReport(ctx, true);
+    if (data === "menu_laporan") return ctx.reply("📊 *Pilih Periode Laporan*", {
+      parse_mode: "MarkdownV2",
+      reply_markup: createReportKeyboard(),
+    });
+    if (data === "menu_export") return showExportMenu(ctx);
+    if (data === "menu_settings") return ctx.reply("⚙️ *Pengaturan MyDuit Ku*", {
+      parse_mode: "MarkdownV2",
+      reply_markup: pengaturanKeyboard,
+    });
+    if (data === "menu_scan") return ctx.reply("📸 *Scan Screenshot*\n\nKirim screenshot transaksi ke chat ini\\. Periksa hasil scan sebelum menyimpan\\.", {
+      parse_mode: "MarkdownV2",
+      reply_markup: createNavigationKeyboard(),
+    });
     if (data === "menu_hapusbank") return handleHapusBank(ctx);
     if (data === "menu_tambahkategori") return handleTambahKategori(ctx);
     if (data === "menu_setlimit") return handleSetLimit(ctx);
     if (data === "menu_editrekening") return handleEditRekening(ctx);
     return;
+  }
+
+  if (data === "laporan_minggu") return generateReport(ctx, false);
+  if (data === "laporan_bulan") return generateReport(ctx, true);
+
+  if (data.startsWith("transfer_from_")) {
+    const accountId = parseCallbackId(data, "transfer_from_");
+    const account = accountId && await getAccountById(accountId, ctx.from.id);
+    if (!account) return ctx.answerCallbackQuery("Rekening tidak valid.");
+    sess.fromAccountId = account.id;
+    sess.fromAccountName = account.bank_name;
+    sess.step = "transfer_to";
+    await saveSession(chatId, sess);
+    const accounts = await getAccounts(ctx.from.id);
+    const kb = new InlineKeyboard();
+    for (const target of accounts) if (target.id !== account.id) kb.text(`🏦 ${target.bank_name}`, `transfer_to_${target.id}`).row();
+    return ctx.editMessageText("↔️ *Pilih rekening tujuan*", { parse_mode: "MarkdownV2", reply_markup: kb });
+  }
+
+  if (data.startsWith("transfer_to_")) {
+    const accountId = parseCallbackId(data, "transfer_to_");
+    const account = accountId && await getAccountById(accountId, ctx.from.id);
+    if (!account || account.id === sess.fromAccountId) return ctx.answerCallbackQuery("Rekening tujuan tidak valid.");
+    sess.toAccountId = account.id;
+    sess.toAccountName = account.bank_name;
+    sess.step = "transfer_amount";
+    await saveSession(chatId, sess);
+    return ctx.editMessageText("💵 Masukkan nominal transfer\\.\n_Contoh: 50000 / 50rb_", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data === "transfer_edit_amount" || data === "transfer_edit_note") {
+    sess.step = data === "transfer_edit_amount" ? "transfer_amount" : "transfer_note";
+    await saveSession(chatId, sess);
+    return ctx.reply(data === "transfer_edit_amount" ? "💵 Masukkan nominal transfer baru\\." : "📝 Ketik catatan transfer, atau `-` untuk mengosongkan\\.", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data === "transfer_note_skip") {
+    sess.transferNote = "";
+    sess.transferId = sess.transferId || createOperationId();
+    sess.step = "transfer_confirm";
+    await saveSession(chatId, sess);
+    return sendTransferPreview(ctx, sess);
+  }
+
+  if (data === "transfer_save") {
+    const saved = await createTransfer(ctx.from.id, sess.fromAccountId, sess.toAccountId, sess.transferAmount, sess.transferNote, sess.transferId);
+    if (!saved) return ctx.answerCallbackQuery("Transfer ini sudah diproses.");
+    const [from, to] = await Promise.all([getAccountById(sess.fromAccountId, ctx.from.id), getAccountById(sess.toAccountId, ctx.from.id)]);
+    await clearSession(chatId);
+    return ctx.editMessageText(`✅ *Transfer tercatat*\n\n${esc(sess.fromAccountName)} → ${esc(sess.toAccountName)}\n*${esc(formatRupiah(sess.transferAmount))}*\n\nSaldo ${esc(from.bank_name)}: *${esc(formatRupiah(from.balance))}*\nSaldo ${esc(to.bank_name)}: *${esc(formatRupiah(to.balance))}*`, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard() });
+  }
+
+  if (data.startsWith("tx_manage_")) {
+    const txId = parseCallbackId(data, "tx_manage_");
+    const tx = txId && await getTransactionById(txId, ctx.from.id);
+    if (!tx) return ctx.answerCallbackQuery("Transaksi tidak ditemukan.");
+    sess.txId = tx.id; sess.txRevision = tx.revision; sess.txAmount = tx.amount; sess.txNote = tx.note || ""; sess.transferId = tx.transfer_id || null;
+    await saveSession(chatId, sess);
+    if (tx.is_transfer) {
+      return ctx.editMessageText(`↔️ *Kelola Transfer*\n\n*${esc(formatRupiah(tx.amount))}*\nMenghapus transfer akan membalikkan saldo pada kedua rekening\\.`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🗑 Hapus Transfer", "tx_delete_confirm").text("❌ Batal", "batal") });
+    }
+    return ctx.editMessageText(`⚙️ *Kelola Transaksi*\n\n${tx.type === "masuk" ? "⬆️" : "⬇️"} *${esc(formatRupiah(tx.amount))}*\n🏦 ${esc(tx.bank_name)}`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("💵 Ubah Nominal", "tx_edit_amount").text("📝 Ubah Catatan", "tx_edit_note").row().text("🗑 Hapus", "tx_delete_confirm").text("❌ Batal", "batal") });
+  }
+
+  if (data === "tx_edit_amount" || data === "tx_edit_note") {
+    sess.step = data === "tx_edit_amount" ? "txedit_amount" : "txedit_note";
+    await saveSession(chatId, sess);
+    return ctx.reply(data === "tx_edit_amount" ? "💵 Masukkan nominal baru\\." : "📝 Ketik catatan baru, atau `-` untuk mengosongkan\\.", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data === "tx_delete_confirm") {
+    return ctx.editMessageText("⚠️ Hapus transaksi ini? Saldo rekening akan dikembalikan\\.", { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🗑 Hapus Transaksi", "tx_delete").text("❌ Batal", "batal") });
+  }
+
+  if (data === "tx_delete") {
+    const deleted = sess.transferId
+      ? await deleteTransfer(sess.transferId, ctx.from.id, sess.txRevision)
+      : await deleteTransaction(sess.txId, ctx.from.id, sess.txRevision);
+    if (!deleted) return ctx.answerCallbackQuery("Transaksi sudah berubah atau terhapus.");
+    await clearSession(chatId);
+    return ctx.editMessageText("✅ Transaksi dihapus dan saldo dikembalikan\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📋 Riwayat", "menu_riwayat"]) });
+  }
+
+  if (data === "export_csv_current") {
+    return exportTransactionsCsv(ctx, getYearMonth());
+  }
+
+  if (data.startsWith("export_csv_")) {
+    const yearMonth = data.replace("export_csv_", "");
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(yearMonth)) {
+      return ctx.reply("⚠️ Periode export tidak valid\\.", { parse_mode: "MarkdownV2" });
+    }
+    return exportTransactionsCsv(ctx, yearMonth);
   }
 
   if (data.startsWith("hapus_")) {
@@ -1409,7 +1628,7 @@ bot.on("callback_query:data", async (ctx) => {
     if (!isSumber && chosen === "✏️ Lainnya") {
       sess.step = "catat_input_kategori";
       await saveSession(chatId, sess);
-      return ctx.editMessageText(`Ketik nama kategori pengeluaran Anda:\n_Contoh: Sedekah_`, { parse_mode: "MarkdownV2" });
+      return ctx.editMessageText(`Ketik nama kategori pengeluaranmu:\n_Contoh: Sedekah_`, { parse_mode: "MarkdownV2" });
     }
 
     if (isSumber) sess.source = chosen;
@@ -1438,9 +1657,72 @@ bot.on("callback_query:data", async (ctx) => {
     return ctx.editMessageText(`💵 Masukkan nominal:\n_Contoh: 25000 / 25rb / 1jt_`, { parse_mode: "MarkdownV2" });
   }
 
+  if (data === "catat_ubah_detail") {
+    const kb = new InlineKeyboard()
+      .text("💵 Nominal", "catat_ubah_nominal")
+      .text("📝 Catatan", "catat_ubah_catatan").row()
+      .text("↕️ Jenis", "catat_ubah_jenis")
+      .text("🏷 Kategori", "catat_ubah_kategori").row()
+      .text("⬅️ Kembali", "catat_preview");
+    return ctx.editMessageText("✏️ *Ubah Detail Transaksi*\n\nPilih data yang ingin diubah\\.", {
+      parse_mode: "MarkdownV2",
+      reply_markup: kb,
+    });
+  }
+
+  if (data === "catat_preview") return sendCatatPreview(ctx, sess);
+
+  if (data === "catat_ubah_catatan") {
+    sess.step = "catat_keterangan";
+    await saveSession(chatId, sess);
+    return ctx.editMessageText("📝 Ketik catatan baru, atau kirim tanda `-` untuk mengosongkan\\.", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data === "catat_ubah_jenis") {
+    const kb = new InlineKeyboard()
+      .text("⬆️ Pemasukan", "catat_edit_tipe_masuk")
+      .text("⬇️ Pengeluaran", "catat_edit_tipe_keluar").row()
+      .text("⬅️ Kembali", "catat_preview");
+    return ctx.editMessageText("↕️ *Pilih jenis transaksi*", { parse_mode: "MarkdownV2", reply_markup: kb });
+  }
+
+  if (data === "catat_edit_tipe_masuk" || data === "catat_edit_tipe_keluar") {
+    sess.type = data === "catat_edit_tipe_masuk" ? "masuk" : "keluar";
+    if (sess.type === "masuk") {
+      sess.source = sess.source || "📦 Lainnya";
+      delete sess.category;
+    } else {
+      sess.category = sess.category || "Lainnya";
+      delete sess.source;
+    }
+    await saveSession(chatId, sess);
+    return sendCatatPreview(ctx, sess);
+  }
+
+  if (data === "catat_ubah_kategori") {
+    if (sess.type !== "keluar") return ctx.answerCallbackQuery("Kategori hanya untuk pengeluaran.");
+    const customCats = await getCustomCategories(ctx.from.id);
+    const kb = new InlineKeyboard();
+    for (const category of [...defaultExpenseCategories, ...customCats.map((cat) => `${cat.emoji} ${cat.name}`)]) {
+      kb.text(category, `catat_edit_kategori_${category}`).row();
+    }
+    kb.text("⬅️ Kembali", "catat_preview");
+    return ctx.editMessageText("🏷 *Pilih kategori*", { parse_mode: "MarkdownV2", reply_markup: kb });
+  }
+
+  if (data.startsWith("catat_edit_kategori_")) {
+    sess.category = data.replace("catat_edit_kategori_", "");
+    await saveSession(chatId, sess);
+    return sendCatatPreview(ctx, sess);
+  }
+
   if (data === "catat_simpan") {
     try {
-      await addTransaction(ctx.from.id, sess.accountId, sess.type, sess.amount, sess.note, sess.category, sess.source);
+      const saved = await addTransaction(
+        ctx.from.id, sess.accountId, sess.type, sess.amount, sess.note,
+        sess.category, sess.source, sess.operationId
+      );
+      if (!saved) return ctx.answerCallbackQuery("Transaksi ini sudah diproses.");
 
       const acc = await getAccountById(sess.accountId, ctx.from.id);
       const icon = sess.type === "masuk" ? "⬆️" : "⬇️";
@@ -1448,7 +1730,7 @@ bot.on("callback_query:data", async (ctx) => {
 
       await clearSession(chatId);
 
-      const msg = `✅ *Transaksi Berhasil Dicatat\\!*\n──────────────────\n🏦 *${esc(acc.bank_name)}*\n${esc(icon)} ${esc(labelKategori)} — ${esc(formatRupiah(sess.amount))}\n${sess.note ? `📝 _${esc(sess.note)}_\n\n` : "\n"}💰 Saldo terkini: *${esc(formatRupiah(acc.balance))}*`;
+      const msg = `✅ *Transaksi tercatat*\n\n${esc(icon)} *${esc(formatRupiah(sess.amount))}* · ${esc(labelKategori)}\n🏦 ${esc(acc.bank_name)}\n${sess.note ? `📝 _${esc(sess.note)}_\n` : ""}💰 Saldo: *${esc(formatRupiah(acc.balance))}*`;
 
       const kbCatatLagi = new InlineKeyboard()
         .text("📝 Catat Lagi", "menu_catat")
@@ -1473,27 +1755,51 @@ bot.on("callback_query:data", async (ctx) => {
     const list = sess.ocrList || [];
     if (list.length === 0) return ctx.editMessageText("⚠️ Data transaksi tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
 
-    // Simpan semua transaksi sekaligus
-    for (const tx of list) {
-      await addTransaction(
-        ctx.from.id, accId, tx.type, tx.nominal,
-        tx.merchant || "Via foto",
-        tx.type === "keluar" ? tx.category : "Lainnya",
-        tx.type === "masuk" ? (tx.category || "📦 Lainnya") : ""
-      );
-    }
+    sess.ocrBulkAccountId = accId;
+    await saveSession(chatId, sess);
+    return ctx.editMessageText(
+      `⚠️ *Konfirmasi Simpan ${list.length} Transaksi*\n\nSemua draf akan dicatat ke *${esc(acc.bank_name)}* dan mengubah saldo\\. Pastikan detail sudah benar\\.`,
+      {
+        parse_mode: "MarkdownV2",
+        reply_markup: new InlineKeyboard()
+          .text("✅ Simpan Semua", "ocr_bulk_confirm")
+          .text("📝 Edit Satu per Satu", "ocr_satu_satu").row()
+          .text("❌ Batal", "batal"),
+      }
+    );
+  }
+
+  if (data === "ocr_bulk_confirm") {
+    const accId = sess.ocrBulkAccountId;
+    const acc = await getAccountById(accId, ctx.from.id);
+    if (!acc) return ctx.editMessageText("⚠️ Rekening tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+    const list = sess.ocrList || [];
+    if (list.length === 0) return ctx.editMessageText("⚠️ Data transaksi tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+
+    await addTransactions(
+      ctx.from.id,
+      accId,
+      list.map((tx) => ({
+        type: tx.type,
+        amount: tx.nominal,
+        note: tx.merchant || "Via foto",
+        category: tx.type === "keluar" ? tx.category : "Lainnya",
+        source: tx.type === "masuk" ? (tx.category || "📦 Lainnya") : "",
+      })),
+      sess.ocrOperationId
+    );
 
     await clearSession(chatId);
     const accAfter = await getAccountById(accId, ctx.from.id);
 
-    let msg = `✅ *${list.length} Transaksi Berhasil Dicatat\\!*\n──────────────────\n`;
+    let msg = `✅ *${list.length} transaksi tercatat*\n\n`;
     list.forEach((tx, i) => {
       const icon = tx.type === "masuk" ? "⬆️" : "⬇️";
       msg += `${i + 1}\\. ${esc(icon)} ${esc(formatRupiah(tx.nominal))}`;
       if (tx.merchant) msg += ` — ${esc(tx.merchant)}`;
       msg += `\n`;
     });
-    msg += `──────────────────\n💰 Saldo terkini: *${esc(formatRupiah(accAfter.balance))}*`;
+    msg += `\n💰 Saldo: *${esc(formatRupiah(accAfter.balance))}*`;
 
     const kb = new InlineKeyboard()
       .text("📝 Catat Lagi", "menu_catat")
@@ -1516,6 +1822,69 @@ bot.on("callback_query:data", async (ctx) => {
     return showOcrKonfirmasi(ctx, sess, accountsList);
   }
 
+  if (data === "ocr_ubah_kategori") {
+    const list = sess.ocrList || [];
+    const tx = list[sess.ocrIndex || 0];
+    if (!tx || tx.type !== "keluar") {
+      return ctx.answerCallbackQuery("Kategori hanya untuk pengeluaran.");
+    }
+
+    const customCats = await getCustomCategories(ctx.from.id);
+    const categories = [...defaultExpenseCategories, ...customCats.map((cat) => `${cat.emoji} ${cat.name}`)];
+    const kb = new InlineKeyboard();
+    for (const category of categories) {
+      kb.text(category, `ocr_kategori_${category}`).row();
+    }
+    kb.text("⬅️ Kembali", "ocr_kategori_batal");
+    return ctx.editMessageText("🏷 *Pilih Kategori Transaksi*", {
+      parse_mode: "MarkdownV2",
+      reply_markup: kb,
+    });
+  }
+
+  if (data === "ocr_ubah_nominal") {
+    sess.step = "ocr_input_nominal";
+    await saveSession(chatId, sess);
+    return ctx.editMessageText("✏️ *Masukkan nominal yang benar*\n_Contoh: 25000 / 25rb / 1jt_", {
+      parse_mode: "MarkdownV2",
+    });
+  }
+
+  if (data === "ocr_ubah_jenis") {
+    const kb = new InlineKeyboard()
+      .text("⬆️ Pemasukan", "ocr_jenis_masuk")
+      .text("⬇️ Pengeluaran", "ocr_jenis_keluar").row()
+      .text("⬅️ Kembali", "ocr_kategori_batal");
+    return ctx.editMessageText("↕️ *Pilih jenis transaksi*", { parse_mode: "MarkdownV2", reply_markup: kb });
+  }
+
+  if (data === "ocr_jenis_masuk" || data === "ocr_jenis_keluar") {
+    const list = sess.ocrList || [];
+    const index = sess.ocrIndex || 0;
+    if (!list[index]) return ctx.editMessageText("⚠️ Data transaksi tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+    list[index].type = data === "ocr_jenis_masuk" ? "masuk" : "keluar";
+    if (list[index].type === "masuk") list[index].category = "📦 Lainnya";
+    sess.ocrList = list;
+    await saveSession(chatId, sess);
+    return showOcrKonfirmasi(ctx, sess, await getAccounts(ctx.from.id));
+  }
+
+  if (data === "ocr_kategori_batal") {
+    const accountsList = await getAccounts(ctx.from.id);
+    return showOcrKonfirmasi(ctx, sess, accountsList);
+  }
+
+  if (data.startsWith("ocr_kategori_")) {
+    const list = sess.ocrList || [];
+    const index = sess.ocrIndex || 0;
+    if (!list[index]) return ctx.editMessageText("⚠️ Data transaksi tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+    list[index].category = data.replace("ocr_kategori_", "");
+    sess.ocrList = list;
+    await saveSession(chatId, sess);
+    const accountsList = await getAccounts(ctx.from.id);
+    return showOcrKonfirmasi(ctx, sess, accountsList);
+  }
+
   if (data.startsWith("ocr_simpan1_")) {
     const accId = parseInt(data.replace("ocr_simpan1_", ""));
     const acc = await getAccountById(accId, ctx.from.id);
@@ -1529,7 +1898,8 @@ bot.on("callback_query:data", async (ctx) => {
       ctx.from.id, accId, tx.type, tx.nominal,
       tx.merchant || "Via foto",
       tx.type === "keluar" ? tx.category : "Lainnya",
-      tx.type === "masuk" ? (tx.category || "📦 Lainnya") : ""
+      tx.type === "masuk" ? (tx.category || "📦 Lainnya") : "",
+      `${sess.ocrOperationId}-${i}`
     );
 
     sess.ocrIndex = i + 1;
@@ -1559,7 +1929,8 @@ bot.on("callback_query:data", async (ctx) => {
       sess.ocrNominal,
       sess.ocrMerchant || "Via foto",
       sess.ocrType === "keluar" ? sess.ocrCategory : "Lainnya",
-      sess.ocrType === "masuk" ? (sess.ocrCategory || "📦 Lainnya") : ""
+      sess.ocrType === "masuk" ? (sess.ocrCategory || "📦 Lainnya") : "",
+      sess.ocrOperationId
     );
 
     await clearSession(chatId);
@@ -1568,12 +1939,11 @@ bot.on("callback_query:data", async (ctx) => {
     const accAfter = await getAccountById(accId, ctx.from.id);
 
     const msg =
-      `✅ *Transaksi Berhasil Dicatat\\!*\n` +
-      `──────────────────\n` +
-      `🏦 *${esc(acc.bank_name)}*\n` +
-      `${esc(icon)} ${esc(formatRupiah(sess.ocrNominal))}\n` +
+      `✅ *Transaksi tercatat*\n\n` +
+      `${esc(icon)} *${esc(formatRupiah(sess.ocrNominal))}*\n` +
+      `🏦 ${esc(acc.bank_name)}\n` +
       `${sess.ocrMerchant ? `🏪 ${esc(sess.ocrMerchant)}\n` : ''}` +
-      `\n💰 Saldo terkini: *${esc(formatRupiah(accAfter.balance))}*`;
+      `💰 Saldo: *${esc(formatRupiah(accAfter.balance))}*`;
 
     const kb = new InlineKeyboard()
       .text("📝 Catat Lagi", "menu_catat")
@@ -1602,7 +1972,7 @@ bot.on("callback_query:data", async (ctx) => {
       .text("❌ Batal", "batal");
 
     return ctx.editMessageText(
-      `✏️ *Edit Rekening*\n────────────────\n🏦 Rekening: *${esc(acc.bank_name)}*\n💰 Saldo saat ini: *${esc(formatRupiah(acc.balance))}*\n\nApa yang ingin diubah?`,
+      `✏️ *Edit Rekening*\n\n🏦 ${esc(acc.bank_name)}\n💰 Saldo: *${esc(formatRupiah(acc.balance))}*\n\nPilih yang ingin diubah\.`,
       { parse_mode: "MarkdownV2", reply_markup: kb }
     );
   }
@@ -1634,19 +2004,15 @@ bot.on("callback_query:data", async (ctx) => {
       return ctx.editMessageText(`ℹ️ Saldo tidak berubah\\.`, { parse_mode: "MarkdownV2" });
     }
 
-    // Update account balance
-    await updateAccountBalance(sess.accountId, ctx.from.id, newBalance);
-
-    // Record correction transaction
-    const diff = newBalance - oldBalance;
-    const type = diff > 0 ? "masuk" : "keluar";
-    const amount = Math.abs(diff);
-    await addTransaction(ctx.from.id, sess.accountId, type, amount, "Koreksi saldo manual", "⚙️ Koreksi", "");
+    const corrected = await correctAccountBalance(
+      ctx.from.id, sess.accountId, newBalance, "Koreksi saldo manual", sess.operationId
+    );
+    if (!corrected) return ctx.answerCallbackQuery("Koreksi ini sudah diproses.");
 
     await clearSession(chatId);
 
     return ctx.editMessageText(
-      `✅ *Saldo Berhasil Diperbarui\\!*\n────────────────\n🏦 ${esc(sess.accountName)}\n💰 Saldo baru: *${esc(formatRupiah(newBalance))}*`,
+      `✅ *Saldo diperbarui*\n\n🏦 ${esc(sess.accountName)}\n💰 Saldo: *${esc(formatRupiah(newBalance))}*`,
       { parse_mode: "MarkdownV2" }
     );
   }
@@ -1659,7 +2025,7 @@ bot.on("callback_query:data", async (ctx) => {
     await clearSession(chatId);
 
     return ctx.editMessageText(
-      `✅ *Nama Rekening Berhasil Diubah\\!*\n────────────────\n💳 ${esc(oldName)} → *${esc(newName)}*`,
+      `✅ *Nama rekening diperbarui*\n\n${esc(oldName)} → *${esc(newName)}*`,
       { parse_mode: "MarkdownV2" }
     );
   }
@@ -1749,9 +2115,63 @@ bot.on("message:text", async (ctx) => {
   }
 
   if (sess.step === "catat_keterangan") {
-    sess.note = text;
+    sess.note = text === "-" ? "" : text;
     await saveSession(chatId, sess);
     return sendCatatPreview(ctx, sess);
+  }
+
+  if (sess.step === "transfer_amount") {
+    const amount = parseNominal(text);
+    if (!isValidNominal(amount)) return ctx.reply("⚠️ Nominal tidak valid\. Coba lagi\.", { parse_mode: "MarkdownV2" });
+    sess.transferAmount = amount;
+    sess.step = "transfer_note_prompt";
+    await saveSession(chatId, sess);
+    return ctx.reply("📝 Tambah catatan transfer? \(opsional\)", { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✏️ Tambah Catatan", "transfer_edit_note").text("⏭ Lewati", "transfer_note_skip") });
+  }
+
+  if (sess.step === "transfer_note") {
+    sess.transferNote = text === "-" ? "" : text;
+    sess.transferId = sess.transferId || createOperationId();
+    sess.step = "transfer_confirm";
+    await saveSession(chatId, sess);
+    return sendTransferPreview(ctx, sess);
+  }
+
+  if (sess.step === "txedit_amount") {
+    const amount = parseNominal(text);
+    if (!isValidNominal(amount)) return ctx.reply("⚠️ Nominal tidak valid\. Coba lagi\.", { parse_mode: "MarkdownV2" });
+    const updated = await updateTransactionAmount(sess.txId, ctx.from.id, sess.txRevision, amount);
+    if (!updated) return ctx.reply("⚠️ Transaksi sudah berubah atau terhapus\. Buka riwayat lagi\.", { parse_mode: "MarkdownV2" });
+    await clearSession(chatId);
+    return ctx.reply("✅ Nominal transaksi diperbarui\. Saldo rekening sudah disesuaikan\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📋 Riwayat", "menu_riwayat"]) });
+  }
+
+  if (sess.step === "txedit_note") {
+    const updated = await updateTransactionNote(sess.txId, ctx.from.id, sess.txRevision, text === "-" ? "" : text);
+    if (!updated) return ctx.reply("⚠️ Transaksi sudah berubah atau terhapus\. Buka riwayat lagi\.", { parse_mode: "MarkdownV2" });
+    await clearSession(chatId);
+    return ctx.reply("✅ Catatan transaksi diperbarui\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📋 Riwayat", "menu_riwayat"]) });
+  }
+
+  if (sess.step === "ocr_input_nominal") {
+    const nominal = parseNominal(text);
+    if (!isValidNominal(nominal)) {
+      return ctx.reply("⚠️ Nominal tidak valid\\. Contoh: _25000 / 25rb / 1jt_", { parse_mode: "MarkdownV2" });
+    }
+    const list = sess.ocrList || [];
+    const index = sess.ocrIndex || 0;
+    if (!list[index]) {
+      await clearSession(chatId);
+      return ctx.reply("⚠️ Sesi scan berakhir\\. Kirim screenshot lagi untuk melanjutkan\\.", {
+        parse_mode: "MarkdownV2",
+        reply_markup: createNavigationKeyboard(["📸 Scan Screenshot", "menu_scan"]),
+      });
+    }
+    list[index].nominal = nominal;
+    sess.ocrList = list;
+    delete sess.step;
+    await saveSession(chatId, sess);
+    return showOcrKonfirmasi(ctx, sess, await getAccounts(ctx.from.id));
   }
 
   // ── EDIT REKENING TEXT INPUTS ──────────────────────────────
@@ -1762,6 +2182,7 @@ bot.on("message:text", async (ctx) => {
     }
 
     sess.newBalance = nominal;
+    sess.operationId = createOperationId();
     const oldBalance = sess.currentBalance;
     const diff = nominal - oldBalance;
     const selisih = diff >= 0 ? `\\+${esc(formatRupiah(diff))}` : `\\-${esc(formatRupiah(Math.abs(diff)))}`;
@@ -1774,7 +2195,7 @@ bot.on("message:text", async (ctx) => {
       .text("❌ Batal", "batal");
 
     return ctx.reply(
-      `🔍 *Konfirmasi Perubahan Saldo*\n────────────────\n🏦 Rekening: *${esc(sess.accountName)}*\n💰 Saldo Lama: *${esc(formatRupiah(oldBalance))}*\n✅ Saldo Baru: *${esc(formatRupiah(nominal))}*\n📊 Selisih: ${selisih}`,
+      `🔍 *Konfirmasi Perubahan Saldo*\n\n🏦 ${esc(sess.accountName)}\n💰 Saldo lama: *${esc(formatRupiah(oldBalance))}*\n✅ Saldo baru: *${esc(formatRupiah(nominal))}*\n📊 Selisih: ${selisih}`,
       { parse_mode: "MarkdownV2", reply_markup: kb }
     );
   }
@@ -1793,10 +2214,15 @@ bot.on("message:text", async (ctx) => {
       .text("❌ Batal", "batal");
 
     return ctx.reply(
-      `🔍 *Konfirmasi Perubahan Nama*\n────────────────\n💳 Nama Lama: *${esc(sess.accountName)}*\n✅ Nama Baru: *${esc(text)}*`,
+      `🔍 *Konfirmasi Perubahan Nama*\n\nNama lama: *${esc(sess.accountName)}*\n✅ Nama baru: *${esc(text)}*`,
       { parse_mode: "MarkdownV2", reply_markup: kb }
     );
   }
+
+  return ctx.reply("🤔 Pesan belum dikenali\\. Pilih menu untuk melanjutkan\\.", {
+    parse_mode: "MarkdownV2",
+    reply_markup: createNavigationKeyboard(),
+  });
 });
 
 // ── VERCEL HANDLER ────────────────────────────────────────────

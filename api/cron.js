@@ -74,9 +74,14 @@ async function sendDailyReminder(telegramId, name) {
     const firstName = name ? name.split(" ")[0] : "kamu";
 
     const messages = [
-      `👀 Hei *${esc(firstName)}\\!* Kamu belum catat transaksi hari ini lho\\.\\nJangan lupa dicatat biar keuanganmu tetap terkontrol ya\\! 💪`,
-      `📝 *Reminder malam\\!*\\nBelum ada catatan transaksi hari ini nih\\.\\nYuk luangkan 30 detik buat catat pengeluaranmu\\! 🕐`,
-      `💸 *${esc(firstName)},* hari ini belum ada catatan transaksi\\.\\nBiasanya lupa itu musuh terbesar keuangan sehat 😅\\nYuk catat sekarang\\!`,
+      `👀 Hei *${esc(firstName)}\\!* Kamu belum catat transaksi hari ini lho\\.
+Jangan lupa dicatat biar keuanganmu tetap terkontrol ya\\! 💪`,
+      `📝 *Reminder malam\\!*
+Belum ada catatan transaksi hari ini nih\\.
+Yuk luangkan 30 detik buat catat pengeluaranmu\\! 🕐`,
+      `💸 *${esc(firstName)},* hari ini belum ada catatan transaksi\\.
+Biasanya lupa itu musuh terbesar keuangan sehat 😅
+Yuk catat sekarang\\!`,
     ];
 
     // Rotate messages so it doesn't feel repetitive
@@ -136,8 +141,7 @@ async function sendMonthlyReport(telegramId, name) {
       `Halo *${esc(firstName)}\\!* Ini ringkasan keuanganmu bulan lalu\\.\n\n` +
       `💰 Pemasukan  : *${esc(formatRupiah(pemasukan))}*\n` +
       `💸 Pengeluaran: *${esc(formatRupiah(pengeluaran))}*\n` +
-      `${selisihIcon} ${selisihLabel}   : *${esc(formatRupiah(Math.abs(selisih)))}*\n` +
-      `──────────────────\n` +
+      `${selisihIcon} ${selisihLabel}   : *${esc(formatRupiah(Math.abs(selisih)))}*\n\n` +
       `🏦 Saldo saat ini: *${esc(formatRupiah(totalBalance))}*\n` +
       `📝 Total transaksi: *${lastMonthTx.length} transaksi*\n\n` +
       `_Semangat mengatur keuangan bulan ini\\! 💪_`;
@@ -179,12 +183,10 @@ async function sendLowBalanceAlert(telegramId) {
       const percent = Math.round(ratio * 100);
 
       const msg =
-        `🚨 *Saldo Hampir Habis\\!*\n` +
-        `──────────────────\n` +
+        `🚨 *Saldo Hampir Habis\\!*\n\n` +
         `🏦 Rekening : *${esc(acc.bank_name)}*\n` +
         `💰 Saldo    : *${esc(formatRupiah(acc.balance))}*\n` +
-        `📉 Tersisa  : *${percent}%* dari saldo awal\n` +
-        `──────────────────\n` +
+        `📉 Tersisa  : *${percent}%* dari saldo awal\n\n` +
         `_Segera isi saldo atau kurangi pengeluaran ya\\!_ 💡`;
 
       await bot.api.sendMessage(telegramId, msg, {
