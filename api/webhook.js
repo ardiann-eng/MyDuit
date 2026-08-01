@@ -1420,7 +1420,7 @@ bot.on("callback_query:data", async (ctx) => {
   }
 
   if (data.startsWith("menu_")) {
-    if (data !== "menu_lainnya") {
+    if (data !== "menu_lainnya" && data !== "menu_transfer") {
       try { await ctx.deleteMessage(); } catch (e) { }
     }
 
