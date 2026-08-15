@@ -1019,7 +1019,7 @@ async function handleSaldo(ctx) {
 
 async function handleRiwayat(ctx, page = 0, edit = false) {
   await clearSession(ctx.chat.id);
-  const pageSize = 15;
+  const pageSize = 10;
   const safePage = Math.max(0, parseInt(page) || 0);
   const txs = await getRecentTransactions(ctx.from.id, pageSize + 1, safePage * pageSize, 30);
   if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2" });
@@ -1049,15 +1049,17 @@ async function handleRiwayat(ctx, page = 0, edit = false) {
       const dateLabel = dateObj.toLocaleDateString('id-ID', {
         day: '2-digit', month: 'short', year: 'numeric'
       });
+      if (index > 0) text += '\n';
       text += `*${esc(dateLabel)}*\n`;
     }
 
     const icon = tx.is_transfer ? "🔄" : tx.type === "masuk" ? "💰" : "💸";
     const label = tx.is_transfer ? "Transfer antar rekening" : tx.type === "masuk" ? (tx.source || "Lainnya") : (tx.category || "Lainnya");
     const branch = isLastInDate ? "└" : "├";
+    const continuation = isLastInDate ? " " : "│";
 
-    text += `${branch} ${icon} *${esc(formatRupiah(tx.amount))}* · ${esc(label)} · ${esc(tx.bank_name)}\n`;
-    if (tx.note) text += `${isLastInDate ? "   " : "│  "}_${esc(tx.note)}_\n`;
+    text += `${branch} ${icon} *${esc(formatRupiah(tx.amount))}* · ${esc(label)}\n`;
+    text += `${continuation}  ${esc(tx.bank_name)}${tx.note ? ` · _${esc(tx.note)}_` : ""}\n`;
   }
 
   if (safePage === 0) {
