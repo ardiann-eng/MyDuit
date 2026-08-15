@@ -1039,26 +1039,25 @@ async function handleRiwayat(ctx, page = 0, edit = false) {
   const totalSaldo = accounts.reduce((sum, a) => sum + a.balance, 0);
 
   let text = `*Riwayat Transaksi* · 30 Hari Terakhir\n\n`;
-  let lastDate = null;
-
-  for (const tx of visibleTxs) {
+  for (const [index, tx] of visibleTxs.entries()) {
     const dateStrRaw = tx.created_at.split(' ')[0]; // "YYYY-MM-DD"
+    const nextTx = visibleTxs[index + 1];
+    const isLastInDate = !nextTx || nextTx.created_at.split(' ')[0] !== dateStrRaw;
 
-    // Show date header if date changed
-    if (dateStrRaw !== lastDate) {
+    if (index === 0 || visibleTxs[index - 1].created_at.split(' ')[0] !== dateStrRaw) {
       const dateObj = new Date(dateStrRaw + 'T00:00:00');
       const dateLabel = dateObj.toLocaleDateString('id-ID', {
         day: '2-digit', month: 'short', year: 'numeric'
       });
       text += `*${esc(dateLabel)}*\n`;
-      lastDate = dateStrRaw;
     }
 
     const icon = tx.is_transfer ? "🔄" : tx.type === "masuk" ? "💰" : "💸";
     const label = tx.is_transfer ? "Transfer antar rekening" : tx.type === "masuk" ? (tx.source || "Lainnya") : (tx.category || "Lainnya");
+    const branch = isLastInDate ? "└" : "├";
 
-    text += `${icon} *${esc(formatRupiah(tx.amount))}* · ${esc(label)} · ${esc(tx.bank_name)}\n`;
-    if (tx.note) text += `└ _${esc(tx.note)}_\n`;
+    text += `${branch} ${icon} *${esc(formatRupiah(tx.amount))}* · ${esc(label)} · ${esc(tx.bank_name)}\n`;
+    if (tx.note) text += `${isLastInDate ? "   " : "│  "}_${esc(tx.note)}_\n`;
   }
 
   if (safePage === 0) {
