@@ -1055,11 +1055,11 @@ async function handleRiwayat(ctx, page = 0, edit = false) {
 
     const icon = tx.is_transfer ? "🔄" : tx.type === "masuk" ? "💰" : "💸";
     const label = tx.is_transfer ? "Transfer antar rekening" : tx.type === "masuk" ? (tx.source || "Lainnya") : (tx.category || "Lainnya");
-    const branch = isLastInDate ? "└" : "├";
-    const continuation = isLastInDate ? " " : "│";
+    const branch = isLastInDate ? "└ " : "├ ";
+    const continuation = "   ";
 
-    text += `${branch} ${icon} *${esc(formatRupiah(tx.amount))}* · ${esc(label)}\n`;
-    text += `${continuation}  ${esc(tx.bank_name)}${tx.note ? ` · _${esc(tx.note)}_` : ""}\n`;
+    text += `${branch}${icon} *${esc(formatRupiah(tx.amount))}* · ${esc(label)}\n`;
+    text += `${continuation}${esc(tx.bank_name)}${tx.note ? ` · _${esc(tx.note)}_` : ""}\n`;
   }
 
   if (safePage === 0) {
