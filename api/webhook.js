@@ -1017,27 +1017,31 @@ async function handleSaldo(ctx) {
   });
 }
 
-async function handleRiwayat(ctx) {
+async function handleRiwayat(ctx, page = 0, edit = false) {
   await clearSession(ctx.chat.id);
-  const txs = await getRecentTransactions(ctx.from.id, 10);
+  const pageSize = 15;
+  const safePage = Math.max(0, parseInt(page) || 0);
+  const txs = await getRecentTransactions(ctx.from.id, pageSize + 1, safePage * pageSize, 30);
   if (txs.length === 0) return ctx.reply(`📋 Belum ada transaksi tercatat\\.\n\nGunakan /catat untuk mencatat transaksi pertama\\.`, { parse_mode: "MarkdownV2" });
+  const hasNextPage = txs.length > pageSize;
+  const visibleTxs = txs.slice(0, pageSize);
 
-  // Fetch data in parallel for footer
-  const [accounts, settings, todaySpend] = await Promise.all([
-    getAccounts(ctx.from.id),
-    getUserSettings(ctx.from.id),
-    getDailySpend(ctx.from.id),
-  ]);
+  const [accounts, settings, todaySpend] = safePage === 0
+    ? await Promise.all([
+      getAccounts(ctx.from.id),
+      getUserSettings(ctx.from.id),
+      getDailySpend(ctx.from.id),
+    ])
+    : [[], null, 0];
   const dailyLimit = computeLimitFromData(settings, accounts);
-  updateSmartLimit(ctx.from.id, dailyLimit).catch(() => { });
+  if (safePage === 0) updateSmartLimit(ctx.from.id, dailyLimit).catch(() => { });
 
   const totalSaldo = accounts.reduce((sum, a) => sum + a.balance, 0);
 
-  // Build compact transaction list with date grouping.
-  let text = `*Riwayat Transaksi* · 10 Terakhir\n\n`;
+  let text = `*Riwayat Transaksi* · 30 Hari Terakhir\n\n`;
   let lastDate = null;
 
-  for (const tx of txs) {
+  for (const tx of visibleTxs) {
     const dateStrRaw = tx.created_at.split(' ')[0]; // "YYYY-MM-DD"
 
     // Show date header if date changed
@@ -1050,40 +1054,34 @@ async function handleRiwayat(ctx) {
       lastDate = dateStrRaw;
     }
 
-    // Transaction format
-    const sign = tx.is_transfer ? "↔" : tx.type === "masuk" ? "\\+" : "\\-";
+    const icon = tx.is_transfer ? "🔄" : tx.type === "masuk" ? "💰" : "💸";
     const label = tx.is_transfer ? "Transfer antar rekening" : tx.type === "masuk" ? (tx.source || "Lainnya") : (tx.category || "Lainnya");
 
-    text += `${sign} *${esc(formatRupiah(tx.amount))}* · ${esc(label)}\n`;
-    text += `  ${esc(tx.bank_name)}`;
-    if (tx.note) text += ` • _${esc(tx.note)}_`;
-    text += `\n\n`;
+    text += `${icon} *${esc(formatRupiah(tx.amount))}* · ${esc(label)} · ${esc(tx.bank_name)}\n`;
+    if (tx.note) text += `└ _${esc(tx.note)}_\n`;
   }
 
-  // Remove trailing blank line before footer
-  text = text.trimEnd() + '\n\n';
-
-  // Footer section: compact spending summary.
-  const pct = dailyLimit > 0
-    ? Math.min(999, Math.round((todaySpend / dailyLimit) * 100))
-    : 0;
-
-  const limitDisplay = dailyLimit > 0
-    ? formatRupiah(Math.round(dailyLimit))
-    : "Belum diatur";
-
-  text += `────────────────\n`;
-  text += `*Hari ini*\n`;
-  text += `${esc(formatRupiah(todaySpend))} dari ${esc(limitDisplay)} · ${esc(pct.toString())}\\%\n`;
-  text += `Sisa saldo: *${esc(formatRupiah(totalSaldo))}*`;
+  if (safePage === 0) {
+    const limitDisplay = dailyLimit > 0
+      ? formatRupiah(Math.round(dailyLimit))
+      : "Belum diatur";
+    text = text.trimEnd() + '\n\n';
+    text += `*Hari Ini*\n├ Keluar ${esc(formatRupiah(todaySpend))} / ${esc(limitDisplay)}\n└ Saldo *${esc(formatRupiah(totalSaldo))}*`;
+  }
 
   const historyKeyboard = new InlineKeyboard()
     .text("📝 Catat", "menu_catat")
     .text("🏠 Menu Utama", "menu_start");
-  await ctx.reply(text, {
+  if (safePage > 0 || hasNextPage) {
+    historyKeyboard.row();
+    if (safePage > 0) historyKeyboard.text("‹ Sebelumnya", `riwayat_page_${safePage - 1}`);
+    if (hasNextPage) historyKeyboard.text("Berikutnya ›", `riwayat_page_${safePage + 1}`);
+  }
+  const options = {
     parse_mode: "MarkdownV2",
     reply_markup: historyKeyboard,
-  });
+  };
+  return edit ? ctx.editMessageText(text, options) : ctx.reply(text, options);
 }
 
 async function handleHapusBank(ctx) {
@@ -1513,6 +1511,14 @@ bot.on("callback_query:data", async (ctx) => {
       await ctx.editMessageText("❌ Proses dibatalkan\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard() });
     }
     return;
+  }
+
+  if (data.startsWith("riwayat_page_")) {
+    const rawPage = data.slice("riwayat_page_".length);
+    if (!/^\d+$/.test(rawPage)) return;
+    const page = Number(rawPage);
+    if (!Number.isSafeInteger(page)) return;
+    return handleRiwayat(ctx, page, true);
   }
 
   if (data.startsWith("menu_")) {
