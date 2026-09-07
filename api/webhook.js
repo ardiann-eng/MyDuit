@@ -1034,12 +1034,12 @@ async function showMainMenu(ctx) {
       const solPart = syncedWallets.length ? formatSolEstimate(totalLamports, solPrices) : "Belum disinkronkan";
       const ethPart = syncedEthWallets.length ? formatEthEstimate(totalWei, solPrices) : "Belum disinkronkan";
       if (wallets.length && ethWallets.length) {
-        text += `├ 🟣 Solana: ${esc(solPart)}\n`;
-        text += `└ 🔵 ETH Robinhood: ${esc(ethPart)}\n\n`;
+        text += `├ Solana: ${esc(solPart)}\n`;
+        text += `└ ETH Robinhood: ${esc(ethPart)}\n\n`;
       } else if (wallets.length) {
-        text += `└ 🟣 Solana: ${esc(solPart)}\n\n`;
+        text += `└ Solana: ${esc(solPart)}\n\n`;
       } else if (ethWallets.length) {
-        text += `└ 🔵 ETH Robinhood: ${esc(ethPart)}\n\n`;
+        text += `└ ETH Robinhood: ${esc(ethPart)}\n\n`;
       }
     }
 
@@ -1120,7 +1120,7 @@ async function handleSaldo(ctx) {
     allCrypto.forEach((w, index) => {
       const isLast = index === allCrypto.length - 1;
       const branch = isLast ? "└" : "├";
-      text += `${branch} ${w.icon} ${esc(w.label)}: ${esc(w.bal)}\n`;
+      text += `${branch} ${esc(w.label)}: ${esc(w.bal)}\n`;
     });
     text += `\n`;
   }
