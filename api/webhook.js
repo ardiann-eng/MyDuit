@@ -392,7 +392,7 @@ function buildTransactionsCsv(txs) {
   const header = ["Tanggal", "Jenis", "Nominal", "Rekening", "Kategori", "Sumber", "Keterangan"];
   const rows = txs.map((tx) => [
     tx.created_at,
-    tx.is_balance_correction ? "Koreksi saldo" : tx.is_transfer ? "Transfer" : tx.type === "masuk" ? "Pemasukan" : "Pengeluaran",
+    tx.is_transfer ? "Transfer" : tx.type === "masuk" ? "Pemasukan" : "Pengeluaran",
     tx.amount,
     tx.bank_name,
     tx.category || "Lainnya",
@@ -2384,7 +2384,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     const corrected = await correctAccountBalance(
-      ctx.from.id, sess.accountId, newBalance, "Koreksi saldo manual", sess.operationId
+      ctx.from.id, sess.accountId, newBalance
     );
     if (!corrected) return ctx.answerCallbackQuery("Koreksi ini sudah diproses.");
 
