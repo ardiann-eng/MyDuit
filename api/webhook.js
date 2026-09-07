@@ -319,7 +319,7 @@ async function handleWallet(ctx) {
   await clearSession(ctx.chat.id);
   const [solWallets, ethWallets] = await Promise.all([getSolWallets(ctx.from.id), getEthWallets(ctx.from.id)]);
   const totalCount = solWallets.length + ethWallets.length;
-  let text = "👛 *Multi-Wallet Manager*\n_Pantau saldo semua wallet Solana & ETH Robinhood_\n\n";
+  let text = "👛 *Multi\\-Wallet Manager*\n_Pantau saldo semua wallet Solana & ETH Robinhood_\n\n";
   if (!totalCount) text += "Belum ada wallet aktif\\. Tambahkan public address untuk mulai memantau saldo\\.\n";
   else text += `📊 *Total Wallet Aktif: ${totalCount}*\n\n`;
 
