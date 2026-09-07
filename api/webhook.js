@@ -304,15 +304,15 @@ async function getSolPrices() {
 function formatSolEstimate(lamports, solPrices) {
   const sol = Number(lamports) / 1_000_000_000;
   if (!solPrices?.usd || !Number.isFinite(sol)) return `${formatSol(lamports)} (estimasi USD belum tersedia)`;
-  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(sol * solPrices.usd);
-  return `${formatSol(lamports)} (est. USD ${usd})`;
+  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(sol * solPrices.usd);
+  return `${formatSol(lamports)} (≈ ${usd})`;
 }
 
 function formatEthEstimate(wei, solPrices) {
   const eth = Number(wei) / 1_000_000_000_000_000_000;
   if (!solPrices?.ethUsd || !Number.isFinite(eth)) return `${formatEth(wei)} (estimasi USD belum tersedia)`;
-  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(eth * solPrices.ethUsd);
-  return `${formatEth(wei)} (est. USD ${usd})`;
+  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(eth * solPrices.ethUsd);
+  return `${formatEth(wei)} (≈ ${usd})`;
 }
 
 async function syncAllUserWallets(telegramId) {
@@ -1013,31 +1013,38 @@ async function showMainMenu(ctx) {
     } else if (score >= 50) {
       tip = "Mulai waspada, cek kategori pengeluaran terbesarmu\\!";
     } else {
-      tip = "Kondisi kritis\\! Kurangi pengeluaran non\\-esensial sekarang\\.  🚨";
+      tip = "Kondisi kritis\\! Tunda pengeluaran non\\-esensial dulu ya\\.";
     }
 
     const solPrices = syncedWallets.length || syncedEthWallets.length ? await getSolPrices() : null;
     const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
     const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
     const totalAset = totalSaldo + solValueIdr + ethValueIdr;
-    let text = `👋 Hai, *${esc(name)}\\!*\nYuk cek kondisi keuanganmu hari ini\\! 🔍\n\n`;
-    text += accounts.length || wallets.length || ethWallets.length
-      ? `📊 *Total Aset*\n└ *${esc(formatRupiah(totalAset))}*\n\n`
-      : "💳 Belum ada rekening atau wallet tercatat\\.\n\n";
-    if (wallets.length || ethWallets.length) {
-      const totalSol = syncedWallets.length ? `*${esc(formatSolEstimate(totalLamports, solPrices))}*` : "Belum disinkronkan";
-      text += `👛 *Total Wallet*\n├ ${wallets.length + ethWallets.length} wallet aktif\n`;
-      if (wallets.length) text += `├ 🪙 SOL: ${wallets.length} wallet · ${totalSol}\n`;
-      if (ethWallets.length) {
-        const totalEth = syncedEthWallets.length ? `*${esc(formatEthEstimate(totalWei, solPrices))}*` : "Belum disinkronkan";
-        text += `└ ⟠ ETH Robinhood: ${ethWallets.length} wallet · ${totalEth}\n`;
-      } else {
-        text += `└\n`;
-      }
-      text += `\n`;
+
+    let text = `👋 Halo, *${esc(name)}\\!*\nRingkasan kondisi keuangan & aset kamu hari ini:\n\n`;
+    text += `💼 *Total Aset*\n└ *${esc(formatRupiah(totalAset))}*\n\n`;
+
+    if (accounts.length > 0) {
+      text += `🏦 *Rekening Bank*\n└ *${esc(formatRupiah(totalSaldo))}* ${esc(`(${accounts.length} rekening)`)}\n\n`;
     }
-    text += `🎯 Skor Kesehatan: *${esc((accounts.length ? score : 0).toString())}/100*${accounts.length ? ` ${esc(scoreEmoji)}` : ""}\n`;
-    text += `💡 _${tip}_\n\nMau ngapain hari ini\\?`;
+
+    const totalWalletCount = wallets.length + ethWallets.length;
+    if (totalWalletCount > 0) {
+      text += `🌐 *Web3 Wallet* ${esc(`(${totalWalletCount} aktif)`)}\n`;
+      const solPart = syncedWallets.length ? formatSolEstimate(totalLamports, solPrices) : "Belum disinkronkan";
+      const ethPart = syncedEthWallets.length ? formatEthEstimate(totalWei, solPrices) : "Belum disinkronkan";
+      if (wallets.length && ethWallets.length) {
+        text += `├ 🟣 Solana: *${esc(solPart)}*\n`;
+        text += `└ 🔵 ETH Robinhood: *${esc(ethPart)}*\n\n`;
+      } else if (wallets.length) {
+        text += `└ 🟣 Solana: *${esc(solPart)}*\n\n`;
+      } else if (ethWallets.length) {
+        text += `└ 🔵 ETH Robinhood: *${esc(ethPart)}*\n\n`;
+      }
+    }
+
+    text += `🎯 Skor Keuangan: *${esc((accounts.length ? score : 0).toString())}/100*${accounts.length ? ` ${esc(scoreEmoji)}` : ""}\n`;
+    text += `💡 _${tip}_\n\nPilih aksi di bawah untuk mulai: 👇`;
 
     const t3 = Date.now();
     await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: startKeyboard });
