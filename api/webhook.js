@@ -308,6 +308,13 @@ function formatSolEstimate(lamports, solPrices) {
   return `${formatSol(lamports)} (est. USD ${usd})`;
 }
 
+function formatEthEstimate(wei, solPrices) {
+  const eth = Number(wei) / 1_000_000_000_000_000_000;
+  if (!solPrices?.ethUsd || !Number.isFinite(eth)) return `${formatEth(wei)} (estimasi USD belum tersedia)`;
+  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(eth * solPrices.ethUsd);
+  return `${formatEth(wei)} (est. USD ${usd})`;
+}
+
 async function syncAllUserWallets(telegramId) {
   const [solWallets, ethWallets] = await Promise.all([getSolWallets(telegramId), getEthWallets(telegramId)]);
   const solTasks = solWallets.map(w => syncSolWallet(w).catch(() => {}));
@@ -1009,19 +1016,20 @@ async function showMainMenu(ctx) {
       tip = "Kondisi kritis\\! Kurangi pengeluaran non\\-esensial sekarang\\.  🚨";
     }
 
-    const solPrices = syncedWallets.length ? await getSolPrices() : null;
+    const solPrices = syncedWallets.length || syncedEthWallets.length ? await getSolPrices() : null;
     const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
-    const totalRekening = totalSaldo + solValueIdr;
+    const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
+    const totalAset = totalSaldo + solValueIdr + ethValueIdr;
     let text = `👋 Hai, *${esc(name)}\\!*\nYuk cek kondisi keuanganmu hari ini\\! 🔍\n\n`;
     text += accounts.length || wallets.length || ethWallets.length
-      ? `💳 *Total Rekening*\n└ *${esc(formatRupiah(totalRekening))}*\n\n`
+      ? `📊 *Total Aset*\n└ *${esc(formatRupiah(totalAset))}*\n\n`
       : "💳 Belum ada rekening atau wallet tercatat\\.\n\n";
     if (wallets.length || ethWallets.length) {
       const totalSol = syncedWallets.length ? `*${esc(formatSolEstimate(totalLamports, solPrices))}*` : "Belum disinkronkan";
       text += `👛 *Total Wallet*\n├ ${wallets.length + ethWallets.length} wallet aktif\n`;
       if (wallets.length) text += `├ 🪙 SOL: ${wallets.length} wallet · ${totalSol}\n`;
       if (ethWallets.length) {
-        const totalEth = syncedEthWallets.length ? `*${esc(formatEth(totalWei))}*` : "Belum disinkronkan";
+        const totalEth = syncedEthWallets.length ? `*${esc(formatEthEstimate(totalWei, solPrices))}*` : "Belum disinkronkan";
         text += `└ ⟠ ETH Robinhood: ${ethWallets.length} wallet · ${totalEth}\n`;
       } else {
         text += `└\n`;
@@ -1082,7 +1090,7 @@ async function handleSaldo(ctx) {
     }
     for (const wallet of ethWallets) {
       const balance = wallet.last_balance_wei
-        ? formatEth(wallet.last_balance_wei)
+        ? formatEthEstimate(wallet.last_balance_wei, solPrices)
         : "Belum disinkronkan";
       text += `🔵 *${esc(wallet.label)}* ${esc("(ETH Robinhood)")}\n├ \`${shortenEthAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
     }
