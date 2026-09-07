@@ -2411,6 +2411,53 @@ bot.on("callback_query:data", async (ctx) => {
 });
 
 // ── TEXT MESSAGE HANDLER ──────────────────────────────────────
+function parseMultiWalletInput(text, defaultLabel, isEth) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const items = [];
+  const validator = isEth ? isValidEthereumAddress : isValidSolanaAddress;
+
+  for (const line of lines) {
+    const colonIdx = line.indexOf(":");
+    const dashIdx = line.indexOf("-");
+    let label = "";
+    let addrCandidate = line;
+
+    if (colonIdx > 0 && colonIdx < line.length - 1) {
+      label = line.slice(0, colonIdx).trim();
+      addrCandidate = line.slice(colonIdx + 1).trim();
+    } else if (dashIdx > 0 && dashIdx < line.length - 1) {
+      label = line.slice(0, dashIdx).trim();
+      addrCandidate = line.slice(dashIdx + 1).trim();
+    }
+
+    const tokens = addrCandidate.split(/[\s,]+/).map(t => t.trim()).filter(Boolean);
+    for (const token of tokens) {
+      if (validator(token)) {
+        items.push({
+          label: label || defaultLabel,
+          address: token,
+        });
+      }
+    }
+  }
+
+  const uniqueMap = new Map();
+  items.forEach(item => {
+    if (!uniqueMap.has(item.address)) uniqueMap.set(item.address, item);
+  });
+  const uniqueItems = Array.from(uniqueMap.values());
+
+  if (uniqueItems.length > 1) {
+    uniqueItems.forEach((item, idx) => {
+      if (item.label === defaultLabel) {
+        item.label = `${defaultLabel} ${idx + 1}`;
+      }
+    });
+  }
+
+  return uniqueItems;
+}
+
 function parseQuickTransaction(text, accounts) {
   const match = text.match(/^(keluar|pengeluaran|expense|masuk|pemasukan|income)\s+([^\s]+)(?:\s+(.+?))?(?:\s+dari\s+(.+))?$/i);
   if (!match) return null;
@@ -2547,16 +2594,42 @@ bot.on("message:text", async (ctx) => {
     sess.walletLabel = text;
     sess.step = "wallet_address";
     await saveSession(chatId, sess);
-    return ctx.reply("🔗 Kirim *public address* Solana\\.\n\n⚠️ Jangan pernah kirim seed phrase atau private key\\.", { parse_mode: "MarkdownV2" });
+    return ctx.reply("🔗 Kirim *public address* Solana\\.\n\n_Tips Multi\\-Wallet: Bisa kirim 1 address atau beberapa address sekaligus \\(1 per baris\\)\\._\n_Contoh multilabel:_\n\`Utama: 9UC6...La1U\`\n\`Trading: 7aX8...K9pL\`\n\n⚠️ Jangan pernah kirim seed phrase atau private key\\.", { parse_mode: "MarkdownV2" });
   }
 
   if (sess.step === "wallet_address") {
-    const address = text.trim();
-    if (!isValidSolanaAddress(address)) return ctx.reply("⚠️ Address Solana tidak valid\\. Kirim public address 32\\-byte Base58\\. Jangan kirim private key\\.", { parse_mode: "MarkdownV2" });
-    sess.walletAddress = address;
-    sess.step = "wallet_confirm";
-    await saveSession(chatId, sess);
-    return ctx.reply(`🪙 *Konfirmasi Wallet Solana*\n\n🏷 Nama\n*${esc(sess.walletLabel)}*\n\n🔗 Public Address\n\`${esc(address)}\``, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✅ Simpan Wallet", "wallet_save").text("❌ Batal", "batal") });
+    const items = parseMultiWalletInput(text, sess.walletLabel || "Solana", false);
+    if (!items.length) return ctx.reply("⚠️ Address Solana tidak valid\\. Kirim public address Base58 32\\-byte\\. Jangan kirim private key\\.", { parse_mode: "MarkdownV2" });
+
+    if (items.length === 1) {
+      sess.walletAddress = items[0].address;
+      sess.walletLabel = items[0].label;
+      sess.step = "wallet_confirm";
+      await saveSession(chatId, sess);
+      return ctx.reply(`🪙 *Konfirmasi Wallet Solana*\n\n🏷 Nama\n*${esc(sess.walletLabel)}*\n\n🔗 Public Address\n\`${esc(items[0].address)}\``, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✅ Simpan Wallet", "wallet_save").text("❌ Batal", "batal") });
+    }
+
+    let addedCount = 0;
+    let resultMsg = `✅ *${items.length} Wallet Solana Berhasil Ditambahkan*\n\n`;
+    for (const item of items) {
+      try {
+        const walletId = await addSolWallet(ctx.from.id, item.label, item.address);
+        const wallet = await getSolWalletById(walletId, ctx.from.id);
+        addedCount++;
+        let balText = "Belum disinkronkan";
+        try {
+          const lamports = await syncSolWallet(wallet);
+          balText = formatSol(lamports);
+        } catch {}
+        resultMsg += `🪙 *${esc(item.label)}*\n├ \`${shortenSolAddress(item.address)}\`\n└ 💰 *${esc(balText)}*\n\n`;
+      } catch (err) {
+        if (String(err.message).includes("UNIQUE")) {
+          resultMsg += `⚠️ *${esc(item.label)}* — Address sudah dipantau sebelumnya\n\n`;
+        }
+      }
+    }
+    await clearSession(chatId);
+    return ctx.reply(resultMsg, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
   }
 
   if (sess.step === "wallet_rename") {
@@ -2588,15 +2661,42 @@ bot.on("message:text", async (ctx) => {
     sess.walletLabel = text;
     sess.step = "eth_wallet_address";
     await saveSession(chatId, sess);
-    return ctx.reply("🔗 Kirim *public address* Ethereum\\. Jangan kirim private key atau seed phrase\\.", { parse_mode: "MarkdownV2" });
+    return ctx.reply("🔗 Kirim *public address* Ethereum\\.\n\n_Tips Multi\\-Wallet: Bisa kirim 1 address atau beberapa address sekaligus \\(1 per baris\\)\\._\n_Contoh multilabel:_\n\`Robinhood 1: 0x1234...abcd\`\n\`Robinhood 2: 0x5678...ef01\`\n\n⚠️ Jangan pernah kirim seed phrase atau private key\\.", { parse_mode: "MarkdownV2" });
   }
 
   if (sess.step === "eth_wallet_address") {
-    if (!isValidEthereumAddress(text)) return ctx.reply("⚠️ Address Ethereum tidak valid\\. Format harus 0x diikuti 40 karakter hex\\.", { parse_mode: "MarkdownV2" });
-    sess.walletAddress = text;
-    sess.step = "eth_wallet_confirm";
-    await saveSession(chatId, sess);
-    return ctx.reply(`⟠ *Konfirmasi Wallet ETH Robinhood*\n\n🏷 *${esc(sess.walletLabel)}*\n🔗 \`${esc(text)}\``, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✅ Simpan Wallet", "eth_wallet_save").text("❌ Batal", "batal") });
+    const items = parseMultiWalletInput(text, sess.walletLabel || "ETH Robinhood", true);
+    if (!items.length) return ctx.reply("⚠️ Address Ethereum tidak valid\\. Format harus 0x diikuti 40 karakter hex\\. Jangan kirim private key\\.", { parse_mode: "MarkdownV2" });
+
+    if (items.length === 1) {
+      sess.walletAddress = items[0].address;
+      sess.walletLabel = items[0].label;
+      sess.step = "eth_wallet_confirm";
+      await saveSession(chatId, sess);
+      return ctx.reply(`⟠ *Konfirmasi Wallet ETH Robinhood*\n\n🏷 *${esc(sess.walletLabel)}*\n🔗 \`${esc(items[0].address)}\``, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✅ Simpan Wallet", "eth_wallet_save").text("❌ Batal", "batal") });
+    }
+
+    let addedCount = 0;
+    let resultMsg = `✅ *${items.length} Wallet ETH Robinhood Berhasil Ditambahkan*\n\n`;
+    for (const item of items) {
+      try {
+        const walletId = await addEthWallet(ctx.from.id, item.label, item.address);
+        const wallet = await getEthWalletById(walletId, ctx.from.id);
+        addedCount++;
+        let balText = "Belum disinkronkan";
+        try {
+          const wei = await syncEthWallet(wallet);
+          balText = formatEth(wei);
+        } catch {}
+        resultMsg += `⟠ *${esc(item.label)}*\n├ \`${shortenEthAddress(item.address)}\`\n└ 💰 *${esc(balText)}*\n\n`;
+      } catch (err) {
+        if (String(err.message).includes("UNIQUE")) {
+          resultMsg += `⚠️ *${esc(item.label)}* — Address sudah dipantau sebelumnya\n\n`;
+        }
+      }
+    }
+    await clearSession(chatId);
+    return ctx.reply(resultMsg, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
   }
 
   if (sess.step === "eth_wallet_rename") {
