@@ -11,9 +11,13 @@ import {
   updateSolWalletBalance,
   setSolWalletError,
   insertSolSnapshot,
+  getActiveEthWallets,
+  updateEthWalletBalance,
+  setEthWalletError,
 } from "../lib/db.js";
 import { formatRupiah, esc } from "../lib/format.js";
 import { getNativeSolBalances, formatSol } from "../lib/solana.js";
+import { getNativeEthBalances } from "../lib/ethereum.js";
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -38,7 +42,7 @@ export default async function handler(req, res) {
     const users = await getAllUsers();
     
     const results = { sent: 0, skipped: 0, errors: 0 };
-    if (isDailyReminder) await syncDailySolWallets();
+    if (isDailyReminder) await Promise.all([syncDailySolWallets(), syncDailyEthWallets()]);
 
     for (const user of users) {
       try {
@@ -61,6 +65,23 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error("Cron error:", err);
     return res.status(200).json({ ok: false, error: err.message });
+  }
+}
+
+async function syncDailyEthWallets() {
+  const wallets = await getActiveEthWallets();
+  for (let offset = 0; offset < wallets.length; offset += 50) {
+    const chunk = wallets.slice(offset, offset + 50);
+    try {
+      const balances = await getNativeEthBalances(chunk.map(wallet => wallet.address));
+      for (const [index, wallet] of chunk.entries()) {
+        const wei = balances[index];
+        await updateEthWalletBalance(wallet.id, wei);
+      }
+    } catch (error) {
+      for (const wallet of chunk) await setEthWalletError(wallet.id, error.message);
+      console.warn("Ethereum wallet sync failed:", error.message);
+    }
   }
 }
 

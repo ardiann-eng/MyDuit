@@ -5,6 +5,7 @@ import {
   getAccountById, deleteAccount, addTransaction, addTransactions, correctAccountBalance,
   createTransfer, getTransactionById, deleteTransaction, deleteTransfer, updateTransactionNote, updateTransactionAmount,
   addSolWallet, getSolWallets, getSolWalletById, updateSolWalletBalance, setSolWalletError, renameSolWallet, replaceSolWalletAddress, deleteSolWallet,
+  addEthWallet, getEthWallets, getEthWalletById, updateEthWalletBalance, setEthWalletError, renameEthWallet, replaceEthWalletAddress, deleteEthWallet,
   getRecentTransactions, addCustomCategory, getCustomCategories,
   getUserSettings, updateDailyLimit, getDailySpend, getWeeklySpend,
   logAlert, getTransactionsByDateRange,
@@ -16,6 +17,7 @@ import {
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 import { isValidSolanaAddress, getNativeSolBalances, formatSol, shortenSolAddress } from "../lib/solana.js";
+import { isValidEthereumAddress, getNativeEthBalances, formatEth, shortenEthAddress } from "../lib/ethereum.js";
 
 // ── SECURITY: VALIDATE REQUIRED ENV VARS ───────────────────────
 const requiredEnvVars = [
@@ -129,7 +131,7 @@ const moreMenuKeyboard = new InlineKeyboard()
   .text("📸 Scan Screenshot", "menu_scan").row()
   .text("🏦 Tambah Rekening", "menu_tambahbank")
   .text("✏️ Edit Rekening", "menu_editrekening").row()
-  .text("🪙 Wallet Solana", "menu_wallet")
+  .text("👛 Wallet", "menu_wallet")
   .text("⚙️ Pengaturan", "menu_settings")
   .text("🏠 Menu Utama", "menu_start");
 
@@ -216,6 +218,40 @@ async function syncSolWallet(wallet) {
   }
 }
 
+async function syncEthWallet(wallet) {
+  try {
+    const [wei] = await getNativeEthBalances([wallet.address]);
+    await updateEthWalletBalance(wallet.id, wei);
+    return wei;
+  } catch (error) {
+    await setEthWalletError(wallet.id, error.message);
+    throw error;
+  }
+}
+
+function createEthWalletActions(wallet) {
+  return new InlineKeyboard()
+    .text("🔄 Sinkronkan", `eth_wallet_sync_${wallet.id}`)
+    .text("✏️ Ganti Nama", `eth_wallet_rename_${wallet.id}`).row()
+    .text("🔗 Ganti Address", `eth_wallet_address_${wallet.id}`).row()
+    .text("🗑 Hapus Wallet", `eth_wallet_delete_${wallet.id}`).row()
+    .text("⬅️ Semua Wallet", "menu_wallet");
+}
+
+async function handleEthWallet(ctx) {
+  await clearSession(ctx.chat.id);
+  const wallets = await getEthWallets(ctx.from.id);
+  let text = "⟠ *Wallet ETH Robinhood*\n_Pantau saldo ETH dari public address Robinhood_\n\n";
+  if (!wallets.length) text += "Belum ada wallet aktif\\. Tambahkan public address untuk mulai memantau saldo\\.\n";
+  for (const wallet of wallets) {
+    text += `⟠ *${esc(wallet.label)}*\n💰 ${esc(wallet.last_balance_wei ? formatEth(wallet.last_balance_wei) : "Belum disinkronkan")}\n🔗 \`${shortenEthAddress(wallet.address)}\`\n\n`;
+  }
+  const kb = new InlineKeyboard().text("➕ Tambah Wallet", "wallet_add");
+  for (const wallet of wallets) kb.row().text(`⟠ ${wallet.label}`, `eth_wallet_pick_${wallet.id}`);
+  kb.row().text("🏠 Menu Utama", "menu_start");
+  return ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
+}
+
 function getWalletBalance(wallet) {
   return wallet.last_balance_lamports ? formatSol(wallet.last_balance_lamports) : "Belum disinkronkan";
 }
@@ -243,12 +279,19 @@ async function getSolPrices() {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-    const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd,idr", { signal: controller.signal });
+     const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana,ethereum&vs_currencies=usd,idr", { signal: controller.signal });
     clearTimeout(timeout);
     if (!response.ok) throw new Error(`SOL price HTTP ${response.status}`);
-    const solana = (await response.json())?.solana;
-    const prices = { usd: Number(solana?.usd), idr: Number(solana?.idr) };
-    if (!Number.isFinite(prices.usd) || prices.usd <= 0 || !Number.isFinite(prices.idr) || prices.idr <= 0) throw new Error("SOL price response invalid");
+     const body = await response.json();
+     const solana = body?.solana;
+     const ethereum = body?.ethereum;
+     const prices = {
+       usd: Number(solana?.usd),
+       idr: Number(solana?.idr),
+       ethUsd: Number(ethereum?.usd),
+       ethIdr: Number(ethereum?.idr),
+     };
+     if (!Number.isFinite(prices.usd) || prices.usd <= 0 || !Number.isFinite(prices.idr) || prices.idr <= 0) throw new Error("Crypto price response invalid");
     solPriceCache = { value: prices, expiresAt: Date.now() + 5 * 60 * 1000 };
     return prices;
   } catch (error) {
@@ -267,16 +310,18 @@ function formatSolEstimate(lamports, solPrices) {
 
 async function handleWallet(ctx) {
   await clearSession(ctx.chat.id);
-  const wallets = await getSolWallets(ctx.from.id);
-  let text = "🪙 *Wallet Solana*\n_Pantau saldo SOL dari public address_\n\n";
-  if (!wallets.length) text += "Belum ada wallet aktif\\. Tambahkan public address untuk mulai memantau saldo\\.\n";
-  for (const wallet of wallets) {
-    text += `🪙 *${esc(wallet.label)}*\n`;
-    text += `💰 ${esc(getWalletBalance(wallet))}\n`;
-    text += `🔗 \`${shortenSolAddress(wallet.address)}\`\n\n`;
+  const [solWallets, ethWallets] = await Promise.all([getSolWallets(ctx.from.id), getEthWallets(ctx.from.id)]);
+  let text = "👛 *Wallet*\n_Pantau saldo SOL dan ETH dari public address_\n\n";
+  if (!solWallets.length && !ethWallets.length) text += "Belum ada wallet aktif\\. Tambahkan public address untuk mulai memantau saldo\\.\n";
+  for (const wallet of solWallets) {
+    text += `🪙 *${esc(wallet.label)}* \(Solana\)\n💰 ${esc(getWalletBalance(wallet))}\n🔗 \`${shortenSolAddress(wallet.address)}\`\n\n`;
+  }
+  for (const wallet of ethWallets) {
+    text += `⟠ *${esc(wallet.label)}* \(ETH Robinhood\)\n💰 ${esc(wallet.last_balance_wei ? formatEth(wallet.last_balance_wei) : "Belum disinkronkan")}\n🔗 \`${shortenEthAddress(wallet.address)}\`\n\n`;
   }
   const kb = new InlineKeyboard().text("➕ Tambah Wallet", "wallet_add");
-  for (const wallet of wallets) kb.row().text(`🪙 ${wallet.label}`, `wallet_pick_${wallet.id}`);
+  for (const wallet of solWallets) kb.row().text(`🪙 ${wallet.label}`, `wallet_pick_${wallet.id}`);
+  for (const wallet of ethWallets) kb.row().text(`⟠ ${wallet.label}`, `eth_wallet_pick_${wallet.id}`);
   kb.row().text("🏠 Menu Utama", "menu_start");
   return ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
 }
@@ -900,7 +945,8 @@ async function showMainMenu(ctx) {
       thisWeek,
       lastWeek,
       thisMonthTxs,
-      wallets,
+       wallets,
+       ethWallets,
     ] = await Promise.all([
       getAccounts(ctx.from.id),
       getUserSettings(ctx.from.id),
@@ -908,7 +954,8 @@ async function showMainMenu(ctx) {
       getWeeklySpend(ctx.from.id, 0),
       getWeeklySpend(ctx.from.id, 1),
       getTransactionsForCurrentMonth(ctx.from.id),
-      getSolWallets(ctx.from.id),
+       getSolWallets(ctx.from.id),
+       getEthWallets(ctx.from.id),
     ]);
     console.log(`⏱ /start step2 parallel fetch: ${Date.now() - t1}ms`);
 
@@ -928,6 +975,8 @@ async function showMainMenu(ctx) {
     const totalSaldo = accounts.reduce((sum, acc) => sum + acc.balance, 0);
     const syncedWallets = wallets.filter((wallet) => wallet.last_balance_lamports !== null && wallet.last_balance_lamports !== undefined);
     const totalLamports = syncedWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_lamports), 0n);
+    const syncedEthWallets = ethWallets.filter((wallet) => wallet.last_balance_wei !== null && wallet.last_balance_wei !== undefined);
+    const totalWei = syncedEthWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_wei), 0n);
 
     // --- DYNAMIC TIP (score-based, max 1 line) ---
     let tip;
@@ -947,12 +996,20 @@ async function showMainMenu(ctx) {
     const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
     const totalRekening = totalSaldo + solValueIdr;
     let text = `👋 Hai, *${esc(name)}\\!*\nYuk cek kondisi keuanganmu hari ini\\! 🔍\n\n`;
-    text += accounts.length || wallets.length
+    text += accounts.length || wallets.length || ethWallets.length
       ? `💳 *Total Rekening*\n└ *${esc(formatRupiah(totalRekening))}*\n\n`
       : "💳 Belum ada rekening atau wallet tercatat\\.\n\n";
-    if (wallets.length) {
+    if (wallets.length || ethWallets.length) {
       const totalSol = syncedWallets.length ? `*${esc(formatSolEstimate(totalLamports, solPrices))}*` : "Belum disinkronkan";
-      text += `🪙 *Total Wallet Solana*\n├ ${wallets.length} wallet aktif\n└ ${totalSol}\n\n`;
+      text += `👛 *Total Wallet*\n├ ${wallets.length + ethWallets.length} wallet aktif\n`;
+      if (wallets.length) text += `├ 🪙 SOL: ${wallets.length} wallet · ${totalSol}\n`;
+      if (ethWallets.length) {
+        const totalEth = syncedEthWallets.length ? `*${esc(formatEth(totalWei))}*` : "Belum disinkronkan";
+        text += `└ ⟠ ETH Robinhood: ${ethWallets.length} wallet · ${totalEth}\n`;
+      } else {
+        text += `└\n`;
+      }
+      text += `\n`;
     }
     text += `🎯 Skor Kesehatan: *${esc((accounts.length ? score : 0).toString())}/100*${accounts.length ? ` ${esc(scoreEmoji)}` : ""}\n`;
     text += `💡 _${tip}_\n\nMau ngapain hari ini\\?`;
@@ -983,8 +1040,8 @@ bot.command("start", async (ctx) => {
 
 async function handleSaldo(ctx) {
   await clearSession(ctx.chat.id);
-  const [accounts, wallets] = await Promise.all([getAccounts(ctx.from.id), getSolWallets(ctx.from.id)]);
-  if (!accounts.length && !wallets.length) return ctx.reply(`💳 Belum ada rekening atau wallet tercatat\\.\n\nGunakan /tambahbank atau buka Wallet Solana untuk menambahkan aset pertama\\.`, { parse_mode: "MarkdownV2" });
+  const [accounts, wallets, ethWallets] = await Promise.all([getAccounts(ctx.from.id), getSolWallets(ctx.from.id), getEthWallets(ctx.from.id)]);
+  if (!accounts.length && !wallets.length && !ethWallets.length) return ctx.reply(`💳 Belum ada rekening atau wallet tercatat\\.\n\nGunakan /tambahbank atau buka menu Wallet untuk menambahkan aset pertama\\.`, { parse_mode: "MarkdownV2" });
 
   let total = 0;
   let text = `💼 *Saldo & Aset*\n\n`;
@@ -993,27 +1050,35 @@ async function handleSaldo(ctx) {
     text += `${icon} *${esc(acc.bank_name)}*\n└ *${esc(formatRupiah(acc.balance))}*\n\n`;
     total += acc.balance;
   }
-  if (wallets.length) {
-    const syncedWallets = wallets.filter((wallet) => wallet.last_balance_lamports !== null && wallet.last_balance_lamports !== undefined);
+  const syncedWallets = wallets.filter((wallet) => wallet.last_balance_lamports !== null && wallet.last_balance_lamports !== undefined);
+  const syncedEthWallets = ethWallets.filter((wallet) => wallet.last_balance_wei !== null && wallet.last_balance_wei !== undefined);
+  if (wallets.length || ethWallets.length) {
     const totalLamports = syncedWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_lamports), 0n);
-    const solPrices = syncedWallets.length ? await getSolPrices() : null;
-    text += `🪙 *Wallet Solana*\n\n`;
+    const totalWei = syncedEthWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_wei), 0n);
+    const solPrices = syncedWallets.length || syncedEthWallets.length ? await getSolPrices() : null;
+    text += `👛 *Wallet*\n\n`;
     for (const wallet of wallets) {
       const balance = wallet.last_balance_lamports
         ? formatSolEstimate(BigInt(wallet.last_balance_lamports), solPrices)
         : "Belum disinkronkan";
       text += `🟣 *${esc(wallet.label)}*\n├ \`${shortenSolAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
     }
-    if (solPrices?.idr) {
-      const solValueIdr = Number(totalLamports) / 1_000_000_000 * solPrices.idr;
-      text += `📊 *Total Aset*\n└ *${esc(formatRupiah(total + solValueIdr))}*`;
+    for (const wallet of ethWallets) {
+      const balance = wallet.last_balance_wei
+        ? formatEth(wallet.last_balance_wei)
+        : "Belum disinkronkan";
+      text += `🔵 *${esc(wallet.label)}* \(ETH Robinhood\)\n├ \`${shortenEthAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
     }
-  } else if (accounts.length) {
+    const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
+    const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
+    const totalAssets = total + solValueIdr + ethValueIdr;
+    text += `📊 *Total Aset*\n└ *${esc(formatRupiah(totalAssets))}*`;
+  } else {
     text += `📊 *Total Aset*\n└ *${esc(formatRupiah(total))}*`;
   }
   await ctx.reply(text, {
     parse_mode: "MarkdownV2",
-    reply_markup: createNavigationKeyboard(["✏️ Edit Rekening", "menu_editrekening"], ["🪙 Wallet Solana", "menu_wallet"]),
+    reply_markup: createNavigationKeyboard(["✏️ Edit Rekening", "menu_editrekening"], ["👛 Wallet", "menu_wallet"]),
   });
 }
 
@@ -1316,6 +1381,7 @@ bot.hears("📝 Catat", handleCatat);
 bot.command("transfer", handleTransfer);
 
 bot.command("wallet", handleWallet);
+bot.command("ethwallet", handleEthWallet);
 
 bot.command("riwayat", handleRiwayat);
 bot.hears("📋 Riwayat", handleRiwayat);
@@ -1547,6 +1613,7 @@ bot.on("callback_query:data", async (ctx) => {
     });
     if (data === "menu_export") return showExportMenu(ctx);
     if (data === "menu_wallet") return handleWallet(ctx);
+    if (data === "menu_eth_wallet") return handleWallet(ctx);
     if (data === "menu_settings") return ctx.reply("⚙️ *Pengaturan MyDuit Ku*", {
       parse_mode: "MarkdownV2",
       reply_markup: pengaturanKeyboard,
@@ -1566,8 +1633,81 @@ bot.on("callback_query:data", async (ctx) => {
   if (data === "laporan_bulan") return generateReport(ctx, true);
 
   if (data === "wallet_add") {
-    await saveSession(chatId, { step: "wallet_label" });
+    return ctx.reply("👛 *Tambah Wallet*\n\nPilih jaringan wallet:", { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🪙 Solana", "wallet_add_sol").text("⟠ ETH Robinhood", "wallet_add_eth").row().text("❌ Batal", "batal") });
+  }
+
+  if (data === "wallet_add_sol") {
+    await saveSession(chatId, { step: "wallet_label", walletType: "sol" });
     return ctx.reply("🪙 *Tambah Wallet Solana*\n\nBeri nama agar mudah dikenali\\.\n_Contoh: Phantom Utama_", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data === "wallet_add_eth" || data === "eth_wallet_add") {
+    await saveSession(chatId, { step: "eth_wallet_label" });
+    return ctx.reply("⟠ *Tambah Wallet ETH Robinhood*\n\nBeri nama agar mudah dikenali\\.\n_Contoh: Robinhood ETH_", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data === "eth_wallet_save") {
+    try {
+      const walletId = await addEthWallet(ctx.from.id, sess.walletLabel, sess.walletAddress);
+      const wallet = await getEthWalletById(walletId, ctx.from.id);
+      await clearSession(chatId);
+      try {
+        const wei = await syncEthWallet(wallet);
+        return ctx.editMessageText(`✅ *Wallet ETH berhasil ditambahkan*\n\n⟠ ${esc(wallet.label)}\n💰 *${esc(formatEth(wei))}*`, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
+      } catch {
+        return ctx.editMessageText("✅ Wallet ETH disimpan\\. Sinkronisasi awal gagal, coba lagi nanti\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
+      }
+    } catch (error) {
+      if (String(error.message).includes("UNIQUE")) return ctx.reply("⚠️ Wallet ini sudah dipantau\\.", { parse_mode: "MarkdownV2" });
+      throw error;
+    }
+  }
+
+  if (data.startsWith("eth_wallet_pick_")) {
+    const walletId = parseCallbackId(data, "eth_wallet_pick_");
+    const wallet = walletId && await getEthWalletById(walletId, ctx.from.id);
+    if (!wallet) return ctx.answerCallbackQuery("Wallet ETH tidak ditemukan.");
+    return ctx.editMessageText(`⟠ *${esc(wallet.label)}*\n\n🔵 *Ethereum Wallet Address*\n├ \`${wallet.address}\`\n└ *${esc(wallet.last_balance_wei ? formatEth(wallet.last_balance_wei) : "Belum disinkronkan")}*`, { parse_mode: "MarkdownV2", reply_markup: createEthWalletActions(wallet) });
+  }
+
+  if (data.startsWith("eth_wallet_sync_")) {
+    const walletId = parseCallbackId(data, "eth_wallet_sync_");
+    const wallet = walletId && await getEthWalletById(walletId, ctx.from.id);
+    if (!wallet) return ctx.answerCallbackQuery("Wallet ETH tidak ditemukan.");
+    try {
+      const wei = await syncEthWallet(wallet);
+      return ctx.editMessageText(`⟠ *${esc(wallet.label)}*\n\n🔵 *Ethereum Wallet Address*\n├ \`${wallet.address}\`\n└ *${esc(formatEth(wei))}*`, { parse_mode: "MarkdownV2", reply_markup: createEthWalletActions({ ...wallet, last_balance_wei: wei }) });
+    } catch {
+      return ctx.reply("⚠️ Sync wallet ETH gagal\\. Saldo terakhir tetap disimpan\\.", { parse_mode: "MarkdownV2" });
+    }
+  }
+
+  if (data.startsWith("eth_wallet_rename_")) {
+    const walletId = parseCallbackId(data, "eth_wallet_rename_");
+    if (!walletId || !await getEthWalletById(walletId, ctx.from.id)) return ctx.answerCallbackQuery("Wallet ETH tidak ditemukan.");
+    await saveSession(chatId, { step: "eth_wallet_rename", walletId });
+    return ctx.reply("✏️ Ketik nama baru wallet ETH\\.", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data.startsWith("eth_wallet_address_")) {
+    const walletId = parseCallbackId(data, "eth_wallet_address_");
+    if (!walletId || !await getEthWalletById(walletId, ctx.from.id)) return ctx.answerCallbackQuery("Wallet ETH tidak ditemukan.");
+    await saveSession(chatId, { step: "eth_wallet_replace_address", walletId });
+    return ctx.reply("🔗 Kirim public address Ethereum baru\\. Jangan kirim private key atau seed phrase\\.", { parse_mode: "MarkdownV2" });
+  }
+
+  if (data.startsWith("eth_wallet_delete_confirm_")) {
+    const walletId = parseCallbackId(data, "eth_wallet_delete_confirm_");
+    if (!walletId || !await getEthWalletById(walletId, ctx.from.id)) return ctx.answerCallbackQuery("Wallet ETH tidak ditemukan.");
+    await deleteEthWallet(walletId, ctx.from.id);
+    return ctx.editMessageText("✅ Wallet ETH tidak lagi dipantau\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
+  }
+
+  if (data.startsWith("eth_wallet_delete_")) {
+    const walletId = parseCallbackId(data, "eth_wallet_delete_");
+    const wallet = walletId && await getEthWalletById(walletId, ctx.from.id);
+    if (!wallet) return ctx.answerCallbackQuery("Wallet ETH tidak ditemukan.");
+    return ctx.editMessageText(`⚠️ *Hapus wallet ETH ini?*\n\n⟠ ${esc(wallet.label)}\n🔗 \`${shortenEthAddress(wallet.address)}\``, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🗑 Ya, Hapus", `eth_wallet_delete_confirm_${wallet.id}`).text("❌ Batal", "batal") });
   }
 
   if (data === "wallet_save") {
@@ -1577,9 +1717,9 @@ bot.on("callback_query:data", async (ctx) => {
       await clearSession(chatId);
       try {
         const lamports = await syncSolWallet(wallet);
-        return ctx.editMessageText(`✅ *Wallet berhasil ditambahkan*\n\n🪙 ${esc(wallet.label)}\n💰 *${esc(formatSol(lamports))}*`, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
+        return ctx.editMessageText(`✅ *Wallet berhasil ditambahkan*\n\n🪙 ${esc(wallet.label)}\n💰 *${esc(formatSol(lamports))}*`, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
       } catch {
-      return ctx.editMessageText("✅ Wallet disimpan\\. Sinkronisasi awal gagal, coba lagi nanti\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
+      return ctx.editMessageText("✅ Wallet disimpan\\. Sinkronisasi awal gagal, coba lagi nanti\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
       }
     } catch (error) {
       if (String(error.message).includes("UNIQUE")) return ctx.reply("⚠️ Wallet ini sudah dipantau\.", { parse_mode: "MarkdownV2" });
@@ -1627,7 +1767,7 @@ bot.on("callback_query:data", async (ctx) => {
     const wallet = walletId && await getSolWalletById(walletId, ctx.from.id);
     if (!wallet) return ctx.answerCallbackQuery("Wallet tidak ditemukan.");
     await deleteSolWallet(wallet.id, ctx.from.id);
-    return ctx.editMessageText("✅ Wallet tidak lagi dipantau\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
+    return ctx.editMessageText("✅ Wallet tidak lagi dipantau\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"])});
   }
 
   if (data.startsWith("wallet_delete_")) {
@@ -2248,6 +2388,24 @@ bot.on("callback_query:data", async (ctx) => {
 });
 
 // ── TEXT MESSAGE HANDLER ──────────────────────────────────────
+function parseQuickTransaction(text, accounts) {
+  const match = text.match(/^(keluar|pengeluaran|expense|masuk|pemasukan|income)\s+([^\s]+)(?:\s+(.+?))?(?:\s+dari\s+(.+))?$/i);
+  if (!match) return null;
+  const type = /^(masuk|pemasukan|income)$/i.test(match[1]) ? "masuk" : "keluar";
+  const amount = parseNominal(match[2]);
+  if (!isValidNominal(amount)) return { error: "Nominal tidak valid. Contoh: keluar 25rb makan siang dari BCA" };
+  const detail = (match[3] || "").trim();
+  const accountHint = (match[4] || "").trim().toLowerCase();
+  const account = accountHint
+    ? accounts.find((item) => item.bank_name.toLowerCase() === accountHint || item.bank_name.toLowerCase().includes(accountHint))
+    : accounts.length === 1 ? accounts[0] : null;
+  if (!account) return { error: accounts.length > 1 ? "Sebut rekening dengan format: `keluar 25rb makan siang dari BCA`" : "Belum ada rekening. Tambah dulu dengan /tambahbank" };
+  const category = type === "keluar"
+    ? (/makan|food|resto|warung|minum/i.test(detail) ? "🍔 Makanan" : /grab|gojek|ojek|parkir|bensin/i.test(detail) ? "🚗 Transport" : /tagihan|listrik|internet|wifi/i.test(detail) ? "🏠 Tagihan" : "Lainnya")
+    : "Lainnya";
+  return { type, amount, note: detail || (type === "masuk" ? "Pemasukan cepat" : "Pengeluaran cepat"), category, source: type === "masuk" ? detail || "📦 Lainnya" : "", account };
+}
+
 bot.on("message:text", async (ctx) => {
   // Security: Rate limiting
   if (isRateLimited(ctx.from.id)) return;
@@ -2255,6 +2413,19 @@ bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text.trim();
   const sess = await getSession(chatId);
+
+  if (!sess.step && !text.startsWith("/")) {
+    const accounts = await getAccounts(ctx.from.id);
+    const quick = parseQuickTransaction(text, accounts);
+    if (quick) {
+      if (quick.error) return ctx.reply(`⚠️ ${quick.error}`, { parse_mode: "MarkdownV2" });
+      const saved = await addTransaction(ctx.from.id, quick.account.id, quick.type, quick.amount, quick.note, quick.category, quick.source, createOperationId());
+      if (!saved) return ctx.reply("⚠️ Transaksi gagal disimpan. Coba lagi.");
+      const updated = await getAccountById(quick.account.id, ctx.from.id);
+      await analyzeAndAlert(ctx, ctx.from.id).catch(() => {});
+      return ctx.reply(`✅ *${quick.type === "masuk" ? "Pemasukan" : "Pengeluaran"} tercatat*\n\n${quick.type === "masuk" ? "⬆️" : "⬇️"} *${esc(formatRupiah(quick.amount))}*\n🏦 ${esc(updated.bank_name)}\n${quick.note ? `📝 ${esc(quick.note)}\n` : ""}💰 Saldo: *${esc(formatRupiah(updated.balance))}*`, { parse_mode: "MarkdownV2" });
+    }
+  }
 
   // Security: Input length validation
   const MAX_LENGTHS = {
@@ -2271,6 +2442,10 @@ bot.on("message:text", async (ctx) => {
     wallet_address: 60,
     wallet_rename: 50,
     wallet_replace_address: 60,
+    eth_wallet_label: 50,
+    eth_wallet_address: 60,
+    eth_wallet_rename: 50,
+    eth_wallet_replace_address: 60,
   };
 
   const maxLen = MAX_LENGTHS[sess.step];
@@ -2366,7 +2541,7 @@ bot.on("message:text", async (ctx) => {
     const updated = await renameSolWallet(sess.walletId, ctx.from.id, text);
     if (!updated) return ctx.reply("⚠️ Wallet tidak ditemukan\\. Buka daftar wallet lagi\\.", { parse_mode: "MarkdownV2" });
     await clearSession(chatId);
-    return ctx.reply("✅ Nama wallet diperbarui\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
+    return ctx.reply("✅ Nama wallet diperbarui\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
   }
 
   if (sess.step === "wallet_replace_address") {
@@ -2378,11 +2553,44 @@ bot.on("message:text", async (ctx) => {
       const wallet = await getSolWalletById(sess.walletId, ctx.from.id);
       await clearSession(chatId);
       try { await syncSolWallet(wallet); } catch { }
-      return ctx.reply("✅ Address wallet diperbarui\\. Saldo sudah disinkronkan ulang\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["🪙 Wallet Solana", "menu_wallet"]) });
+      return ctx.reply("✅ Address wallet diperbarui\\. Saldo sudah disinkronkan ulang\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
     } catch (error) {
       if (String(error.message).includes("UNIQUE")) return ctx.reply("⚠️ Address ini sudah dipantau\. Coba address lain\.", { parse_mode: "MarkdownV2" });
       throw error;
     }
+  }
+
+  if (sess.step === "eth_wallet_label") {
+    if (text.length < 2) return ctx.reply("⚠️ Nama wallet minimal 2 karakter\\.", { parse_mode: "MarkdownV2" });
+    sess.walletLabel = text;
+    sess.step = "eth_wallet_address";
+    await saveSession(chatId, sess);
+    return ctx.reply("🔗 Kirim *public address* Ethereum\\. Jangan kirim private key atau seed phrase\\.", { parse_mode: "MarkdownV2" });
+  }
+
+  if (sess.step === "eth_wallet_address") {
+    if (!isValidEthereumAddress(text)) return ctx.reply("⚠️ Address Ethereum tidak valid\\. Format harus 0x diikuti 40 karakter hex\\.", { parse_mode: "MarkdownV2" });
+    sess.walletAddress = text;
+    sess.step = "eth_wallet_confirm";
+    await saveSession(chatId, sess);
+    return ctx.reply(`⟠ *Konfirmasi Wallet ETH Robinhood*\n\n🏷 *${esc(sess.walletLabel)}*\n🔗 \`${esc(text)}\``, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✅ Simpan Wallet", "eth_wallet_save").text("❌ Batal", "batal") });
+  }
+
+  if (sess.step === "eth_wallet_rename") {
+    if (text.length < 2) return ctx.reply("⚠️ Nama wallet minimal 2 karakter\\.", { parse_mode: "MarkdownV2" });
+    const updated = await renameEthWallet(sess.walletId, ctx.from.id, text);
+    await clearSession(chatId);
+    return ctx.reply(updated ? "✅ Nama wallet ETH diperbarui\\." : "⚠️ Wallet ETH tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+  }
+
+  if (sess.step === "eth_wallet_replace_address") {
+    if (!isValidEthereumAddress(text)) return ctx.reply("⚠️ Address Ethereum tidak valid\\.", { parse_mode: "MarkdownV2" });
+    const updated = await replaceEthWalletAddress(sess.walletId, ctx.from.id, text);
+    if (!updated) return ctx.reply("⚠️ Wallet ETH tidak ditemukan\\.", { parse_mode: "MarkdownV2" });
+    const wallet = await getEthWalletById(sess.walletId, ctx.from.id);
+    await clearSession(chatId);
+    try { await syncEthWallet(wallet); } catch { }
+    return ctx.reply("✅ Address wallet ETH diperbarui\\. Saldo sudah disinkronkan ulang\\.", { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["👛 Wallet", "menu_wallet"]) });
   }
 
   if (sess.step === "transfer_amount") {
