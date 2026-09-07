@@ -305,14 +305,14 @@ function formatSolEstimate(lamports, solPrices) {
   const sol = Number(lamports) / 1_000_000_000;
   if (!solPrices?.usd || !Number.isFinite(sol)) return `${formatSol(lamports)} (estimasi USD belum tersedia)`;
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(sol * solPrices.usd);
-  return `${formatSol(lamports)} (≈ ${usd})`;
+  return `${formatSol(lamports)} (${usd})`;
 }
 
 function formatEthEstimate(wei, solPrices) {
   const eth = Number(wei) / 1_000_000_000_000_000_000;
   if (!solPrices?.ethUsd || !Number.isFinite(eth)) return `${formatEth(wei)} (estimasi USD belum tersedia)`;
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(eth * solPrices.ethUsd);
-  return `${formatEth(wei)} (≈ ${usd})`;
+  return `${formatEth(wei)} (${usd})`;
 }
 
 async function syncAllUserWallets(telegramId) {
@@ -1094,9 +1094,7 @@ async function handleSaldo(ctx) {
     accounts.forEach((acc, index) => {
       const isLast = index === accounts.length - 1;
       const branch = isLast ? "└" : "├";
-      const subPipe = isLast ? "   " : "│  ";
-      const icon = acc.bank_name.toLowerCase().includes("cash") || acc.bank_name.toLowerCase().includes("tunai") ? "💵" : "💳";
-      text += `${branch} ${icon} ${esc(acc.bank_name)}\n${subPipe}└ ${esc(formatRupiah(acc.balance))}\n`;
+      text += `${branch} ${esc(acc.bank_name)}: ${esc(formatRupiah(acc.balance))}\n`;
     });
     text += `\n`;
   }
@@ -1109,13 +1107,11 @@ async function handleSaldo(ctx) {
     const allCrypto = [
       ...wallets.map(w => ({
         label: w.label,
-        chain: "Solana",
         icon: "🟣",
         bal: w.last_balance_lamports ? formatSolEstimate(BigInt(w.last_balance_lamports), solPrices) : "Belum disinkronkan",
       })),
       ...ethWallets.map(w => ({
         label: w.label,
-        chain: "ETH Robinhood",
         icon: "🔵",
         bal: w.last_balance_wei ? formatEthEstimate(w.last_balance_wei, solPrices) : "Belum disinkronkan",
       })),
@@ -1124,8 +1120,7 @@ async function handleSaldo(ctx) {
     allCrypto.forEach((w, index) => {
       const isLast = index === allCrypto.length - 1;
       const branch = isLast ? "└" : "├";
-      const subPipe = isLast ? "   " : "│  ";
-      text += `${branch} ${w.icon} ${esc(w.label)} ${esc(`(${w.chain})`)}\n${subPipe}└ ${esc(w.bal)}\n`;
+      text += `${branch} ${w.icon} ${esc(w.label)}: ${esc(w.bal)}\n`;
     });
     text += `\n`;
   }
