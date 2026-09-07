@@ -308,21 +308,38 @@ function formatSolEstimate(lamports, solPrices) {
   return `${formatSol(lamports)} (est. USD ${usd})`;
 }
 
+async function syncAllUserWallets(telegramId) {
+  const [solWallets, ethWallets] = await Promise.all([getSolWallets(telegramId), getEthWallets(telegramId)]);
+  const solTasks = solWallets.map(w => syncSolWallet(w).catch(() => {}));
+  const ethTasks = ethWallets.map(w => syncEthWallet(w).catch(() => {}));
+  await Promise.all([...solTasks, ...ethTasks]);
+}
+
 async function handleWallet(ctx) {
   await clearSession(ctx.chat.id);
   const [solWallets, ethWallets] = await Promise.all([getSolWallets(ctx.from.id), getEthWallets(ctx.from.id)]);
-  let text = "👛 *Wallet*\n_Pantau saldo SOL dan ETH dari public address_\n\n";
-  if (!solWallets.length && !ethWallets.length) text += "Belum ada wallet aktif\\. Tambahkan public address untuk mulai memantau saldo\\.\n";
+  const totalCount = solWallets.length + ethWallets.length;
+  let text = "👛 *Multi-Wallet Manager*\n_Pantau saldo semua wallet Solana & ETH Robinhood_\n\n";
+  if (!totalCount) text += "Belum ada wallet aktif\\. Tambahkan public address untuk mulai memantau saldo\\.\n";
+  else text += `📊 *Total Wallet Aktif: ${totalCount}*\n\n`;
+
   for (const wallet of solWallets) {
     text += `🪙 *${esc(wallet.label)}* \(Solana\)\n💰 ${esc(getWalletBalance(wallet))}\n🔗 \`${shortenSolAddress(wallet.address)}\`\n\n`;
   }
   for (const wallet of ethWallets) {
     text += `⟠ *${esc(wallet.label)}* \(ETH Robinhood\)\n💰 ${esc(wallet.last_balance_wei ? formatEth(wallet.last_balance_wei) : "Belum disinkronkan")}\n🔗 \`${shortenEthAddress(wallet.address)}\`\n\n`;
   }
-  const kb = new InlineKeyboard().text("➕ Tambah Wallet", "wallet_add");
+  const kb = new InlineKeyboard();
+  kb.text("➕ Tambah Wallet", "wallet_add");
+  if (totalCount > 0) kb.text("🔄 Sinkronkan Semua", "wallet_sync_all");
+  kb.row();
   for (const wallet of solWallets) kb.row().text(`🪙 ${wallet.label}`, `wallet_pick_${wallet.id}`);
   for (const wallet of ethWallets) kb.row().text(`⟠ ${wallet.label}`, `eth_wallet_pick_${wallet.id}`);
   kb.row().text("🏠 Menu Utama", "menu_start");
+
+  if (ctx.callbackQuery) {
+    return ctx.editMessageText(text, { parse_mode: "MarkdownV2", reply_markup: kb }).catch(() => ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb }));
+  }
   return ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: kb });
 }
 
@@ -1631,6 +1648,12 @@ bot.on("callback_query:data", async (ctx) => {
 
   if (data === "laporan_minggu") return generateReport(ctx, false);
   if (data === "laporan_bulan") return generateReport(ctx, true);
+
+  if (data === "wallet_sync_all") {
+    await ctx.answerCallbackQuery("⏳ Menyinkronkan semua wallet...");
+    await syncAllUserWallets(ctx.from.id);
+    return handleWallet(ctx);
+  }
 
   if (data === "wallet_add") {
     return ctx.reply("👛 *Tambah Wallet*\n\nPilih jaringan wallet:", { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("🪙 Solana", "wallet_add_sol").text("⟠ ETH Robinhood", "wallet_add_eth").row().text("❌ Batal", "batal") });
