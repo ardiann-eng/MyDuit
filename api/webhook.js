@@ -324,10 +324,10 @@ async function handleWallet(ctx) {
   else text += `📊 *Total Wallet Aktif: ${totalCount}*\n\n`;
 
   for (const wallet of solWallets) {
-    text += `🪙 *${esc(wallet.label)}* \(Solana\)\n💰 ${esc(getWalletBalance(wallet))}\n🔗 \`${shortenSolAddress(wallet.address)}\`\n\n`;
+    text += `🪙 *${esc(wallet.label)}* ${esc("(Solana)")}\n💰 ${esc(getWalletBalance(wallet))}\n🔗 \`${shortenSolAddress(wallet.address)}\`\n\n`;
   }
   for (const wallet of ethWallets) {
-    text += `⟠ *${esc(wallet.label)}* \(ETH Robinhood\)\n💰 ${esc(wallet.last_balance_wei ? formatEth(wallet.last_balance_wei) : "Belum disinkronkan")}\n🔗 \`${shortenEthAddress(wallet.address)}\`\n\n`;
+    text += `⟠ *${esc(wallet.label)}* ${esc("(ETH Robinhood)")}\n💰 ${esc(wallet.last_balance_wei ? formatEth(wallet.last_balance_wei) : "Belum disinkronkan")}\n🔗 \`${shortenEthAddress(wallet.address)}\`\n\n`;
   }
   const kb = new InlineKeyboard();
   kb.text("➕ Tambah Wallet", "wallet_add");
@@ -1084,7 +1084,7 @@ async function handleSaldo(ctx) {
       const balance = wallet.last_balance_wei
         ? formatEth(wallet.last_balance_wei)
         : "Belum disinkronkan";
-      text += `🔵 *${esc(wallet.label)}* \(ETH Robinhood\)\n├ \`${shortenEthAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
+      text += `🔵 *${esc(wallet.label)}* ${esc("(ETH Robinhood)")}\n├ \`${shortenEthAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
     }
     const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
     const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
@@ -2622,7 +2622,7 @@ bot.on("message:text", async (ctx) => {
     sess.transferAmount = amount;
     sess.step = "transfer_note_prompt";
     await saveSession(chatId, sess);
-    return ctx.reply("📝 Tambah catatan transfer? \(opsional\)", { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✏️ Tambah Catatan", "transfer_edit_note").text("⏭ Lewati", "transfer_note_skip").row().text("❌ Batal", "batal") });
+    return ctx.reply(`📝 Tambah catatan transfer? ${esc("(opsional)")}`, { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("✏️ Tambah Catatan", "transfer_edit_note").text("⏭ Lewati", "transfer_note_skip").row().text("❌ Batal", "batal") });
   }
 
   if (sess.step === "transfer_note") {
