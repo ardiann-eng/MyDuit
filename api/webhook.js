@@ -2459,21 +2459,73 @@ function parseMultiWalletInput(text, defaultLabel, isEth) {
 }
 
 function parseQuickTransaction(text, accounts) {
-  const match = text.match(/^(keluar|pengeluaran|expense|masuk|pemasukan|income)\s+([^\s]+)(?:\s+(.+?))?(?:\s+dari\s+(.+))?$/i);
-  if (!match) return null;
-  const type = /^(masuk|pemasukan|income)$/i.test(match[1]) ? "masuk" : "keluar";
-  const amount = parseNominal(match[2]);
-  if (!isValidNominal(amount)) return { error: "Nominal tidak valid. Contoh: keluar 25rb makan siang dari BCA" };
-  const detail = (match[3] || "").trim();
-  const accountHint = (match[4] || "").trim().toLowerCase();
-  const account = accountHint
-    ? accounts.find((item) => item.bank_name.toLowerCase() === accountHint || item.bank_name.toLowerCase().includes(accountHint))
-    : accounts.length === 1 ? accounts[0] : null;
-  if (!account) return { error: accounts.length > 1 ? "Sebut rekening dengan format: `keluar 25rb makan siang dari BCA`" : "Belum ada rekening. Tambah dulu dengan /tambahbank" };
-  const category = type === "keluar"
-    ? (/makan|food|resto|warung|minum/i.test(detail) ? "🍔 Makanan" : /grab|gojek|ojek|parkir|bensin/i.test(detail) ? "🚗 Transport" : /tagihan|listrik|internet|wifi/i.test(detail) ? "🏠 Tagihan" : "Lainnya")
-    : "Lainnya";
-  return { type, amount, note: detail || (type === "masuk" ? "Pemasukan cepat" : "Pengeluaran cepat"), category, source: type === "masuk" ? detail || "📦 Lainnya" : "", account };
+  if (!accounts || !accounts.length) return null;
+  const rawText = text.trim();
+  if (rawText.startsWith("/")) return null;
+
+  const nominalRegex = /(?:rp\.?\s*)?(\b\d+(?:[.,]\d+)?\s*(?:jt|juta|rb|ribu|k)?\b)/i;
+  const nominalMatch = rawText.match(nominalRegex);
+  if (!nominalMatch) return null;
+
+  const rawNominalStr = nominalMatch[1];
+  const amount = parseNominal(rawNominalStr);
+  if (!isValidNominal(amount)) return null;
+
+  const isExplicitMasuk = /\b(masuk|pemasukan|income|gaji|bonus|topup|terima|dapat)\b/i.test(rawText);
+  const isExplicitKeluar = /\b(keluar|pengeluaran|expense|bayar|beli)\b/i.test(rawText);
+  const type = isExplicitMasuk && !isExplicitKeluar ? "masuk" : "keluar";
+
+  let remainder = rawText
+    .replace(nominalMatch[0], "")
+    .replace(/\b(keluar|pengeluaran|expense|masuk|pemasukan|income)\b/gi, "")
+    .replace(/\b(dari|pakai|di|lewat|via|ke)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let matchedAccount = null;
+  for (const acc of accounts) {
+    const accName = acc.bank_name.toLowerCase();
+    const words = remainder.toLowerCase().split(/\s+/);
+    if (words.includes(accName) || remainder.toLowerCase().includes(accName)) {
+      matchedAccount = acc;
+      const regex = new RegExp(`\\b${accName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi");
+      remainder = remainder.replace(regex, "").trim();
+      break;
+    }
+  }
+
+  if (!matchedAccount) {
+    if (accounts.length === 1) {
+      matchedAccount = accounts[0];
+    } else {
+      if (isExplicitMasuk || isExplicitKeluar) {
+        return { error: `Sebutkan nama rekening di chat\\. Contoh: \`${rawText} dari ${accounts[0].bank_name}\`` };
+      }
+      return null;
+    }
+  }
+
+  const note = remainder.trim() || (type === "masuk" ? "Pemasukan" : "Pengeluaran");
+
+  let category = "Lainnya";
+  if (type === "keluar") {
+    const lowerNote = note.toLowerCase();
+    if (/makan|food|resto|warung|minum|kopi|bakso|nasi|gofood|grabfood/i.test(lowerNote)) category = "🍔 Makanan";
+    else if (/bensin|grab|gojek|ojek|parkir|pertamina|taksi|angkot|toll/i.test(lowerNote)) category = "🚗 Transport";
+    else if (/tagihan|listrik|pln|pdam|wifi|indihome|pulsa|kuota|kos|sewa/i.test(lowerNote)) category = "🏠 Tagihan";
+    else if (/shopee|tokopedia|lazada|baju|skincare|belanja/i.test(lowerNote)) category = "👗 Gaya Hidup";
+    else if (/game|steam|netflix|spotify|bioskop|nonton/i.test(lowerNote)) category = "🎮 Hiburan";
+    else if (/obat|apotek|dokter|klinik|rumah sakit|vitamin/i.test(lowerNote)) category = "💊 Kesehatan";
+  }
+
+  return {
+    type,
+    amount,
+    note,
+    category,
+    source: type === "masuk" ? (note || "📦 Lainnya") : "",
+    account: matchedAccount,
+  };
 }
 
 bot.on("message:text", async (ctx) => {
