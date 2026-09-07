@@ -2512,8 +2512,8 @@ function parseQuickTransaction(text, accounts) {
     const lowerNote = note.toLowerCase();
     if (/makan|food|resto|warung|minum|kopi|bakso|nasi|gofood|grabfood/i.test(lowerNote)) category = "🍔 Makanan";
     else if (/bensin|grab|gojek|ojek|parkir|pertamina|taksi|angkot|toll/i.test(lowerNote)) category = "🚗 Transport";
-    else if (/tagihan|listrik|pln|pdam|wifi|indihome|pulsa|kuota|kos|sewa/i.test(lowerNote)) category = "🏠 Tagihan";
-    else if (/shopee|tokopedia|lazada|baju|skincare|belanja/i.test(lowerNote)) category = "👗 Gaya Hidup";
+    else if (/tagihan|listrik|pln|pdam|wifi|indihome|pulsa|kuota|kos|sewa|rumah|kursi|meja|kasur|perabot/i.test(lowerNote)) category = "🏠 Tagihan";
+    else if (/shopee|tokopedia|lazada|baju|skincare|belanja|sepatu/i.test(lowerNote)) category = "👗 Gaya Hidup";
     else if (/game|steam|netflix|spotify|bioskop|nonton/i.test(lowerNote)) category = "🎮 Hiburan";
     else if (/obat|apotek|dokter|klinik|rumah sakit|vitamin/i.test(lowerNote)) category = "💊 Kesehatan";
   }
