@@ -1075,39 +1075,60 @@ async function handleSaldo(ctx) {
   const [accounts, wallets, ethWallets] = await Promise.all([getAccounts(ctx.from.id), getSolWallets(ctx.from.id), getEthWallets(ctx.from.id)]);
   if (!accounts.length && !wallets.length && !ethWallets.length) return ctx.reply(`💳 Belum ada rekening atau wallet tercatat\\.\n\nGunakan /tambahbank atau buka menu Wallet untuk menambahkan aset pertama\\.`, { parse_mode: "MarkdownV2" });
 
-  let total = 0;
-  let text = `💼 *Saldo & Aset*\n\n`;
-  for (const acc of accounts) {
-    const icon = acc.balance >= 0 ? "🟢" : "🔴";
-    text += `${icon} *${esc(acc.bank_name)}*\n└ *${esc(formatRupiah(acc.balance))}*\n\n`;
-    total += acc.balance;
-  }
   const syncedWallets = wallets.filter((wallet) => wallet.last_balance_lamports !== null && wallet.last_balance_lamports !== undefined);
   const syncedEthWallets = ethWallets.filter((wallet) => wallet.last_balance_wei !== null && wallet.last_balance_wei !== undefined);
-  if (wallets.length || ethWallets.length) {
-    const totalLamports = syncedWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_lamports), 0n);
-    const totalWei = syncedEthWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_wei), 0n);
-    const solPrices = syncedWallets.length || syncedEthWallets.length ? await getSolPrices() : null;
-    text += `👛 *Wallet*\n\n`;
-    for (const wallet of wallets) {
-      const balance = wallet.last_balance_lamports
-        ? formatSolEstimate(BigInt(wallet.last_balance_lamports), solPrices)
-        : "Belum disinkronkan";
-      text += `🟣 *${esc(wallet.label)}*\n├ \`${shortenSolAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
-    }
-    for (const wallet of ethWallets) {
-      const balance = wallet.last_balance_wei
-        ? formatEthEstimate(wallet.last_balance_wei, solPrices)
-        : "Belum disinkronkan";
-      text += `🔵 *${esc(wallet.label)}* ${esc("(ETH Robinhood)")}\n├ \`${shortenEthAddress(wallet.address)}\`\n└ *${esc(balance)}*\n\n`;
-    }
-    const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
-    const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
-    const totalAssets = total + solValueIdr + ethValueIdr;
-    text += `📊 *Total Aset*\n└ *${esc(formatRupiah(totalAssets))}*`;
-  } else {
-    text += `📊 *Total Aset*\n└ *${esc(formatRupiah(total))}*`;
+  const totalLamports = syncedWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_lamports), 0n);
+  const totalWei = syncedEthWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_wei), 0n);
+  const solPrices = syncedWallets.length || syncedEthWallets.length ? await getSolPrices() : null;
+
+  const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
+  const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
+  const totalBank = accounts.reduce((sum, acc) => sum + acc.balance, 0);
+  const totalWeb3 = solValueIdr + ethValueIdr;
+  const totalAssets = totalBank + totalWeb3;
+
+  let text = `💼 *Rincian Saldo & Aset*\n\n`;
+
+  if (accounts.length > 0) {
+    text += `🏦 *Rekening Bank* ${esc(`(${formatRupiah(totalBank)})`)}\n`;
+    accounts.forEach((acc, index) => {
+      const isLast = index === accounts.length - 1;
+      const branch = isLast ? "└" : "├";
+      const icon = acc.balance >= 0 ? "🟢" : "🔴";
+      text += `${branch} ${icon} ${esc(acc.bank_name)} · *${esc(formatRupiah(acc.balance))}*\n`;
+    });
+    text += `\n`;
   }
+
+  const totalWalletCount = wallets.length + ethWallets.length;
+  if (totalWalletCount > 0) {
+    const totalWeb3Label = (solPrices?.idr || solPrices?.ethIdr) ? formatRupiah(totalWeb3) : "Belum disinkronkan";
+    text += `🌐 *Web3 Wallet* ${esc(`(${totalWeb3Label})`)}\n`;
+
+    const allCrypto = [
+      ...wallets.map(w => ({
+        label: w.label,
+        isSol: true,
+        bal: w.last_balance_lamports ? formatSolEstimate(BigInt(w.last_balance_lamports), solPrices) : "Belum disinkronkan",
+      })),
+      ...ethWallets.map(w => ({
+        label: w.label,
+        isSol: false,
+        bal: w.last_balance_wei ? formatEthEstimate(w.last_balance_wei, solPrices) : "Belum disinkronkan",
+      })),
+    ];
+
+    allCrypto.forEach((w, index) => {
+      const isLast = index === allCrypto.length - 1;
+      const branch = isLast ? "└" : "├";
+      const icon = w.isSol ? "🟣" : "🔵";
+      text += `${branch} ${icon} ${esc(w.label)} · *${esc(w.bal)}*\n`;
+    });
+    text += `\n`;
+  }
+
+  text += `📊 *Total Aset Keseluruhan*\n└ *${esc(formatRupiah(totalAssets))}*`;
+
   await ctx.reply(text, {
     parse_mode: "MarkdownV2",
     reply_markup: createNavigationKeyboard(["✏️ Edit Rekening", "menu_editrekening"], ["👛 Wallet", "menu_wallet"]),
