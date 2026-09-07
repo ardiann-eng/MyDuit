@@ -1025,7 +1025,7 @@ async function showMainMenu(ctx) {
     text += `💼 *Total Aset*\n└ *${esc(formatRupiah(totalAset))}*\n\n`;
 
     if (accounts.length > 0) {
-      text += `🏦 *Rekening Bank*\n└ *${esc(formatRupiah(totalSaldo))}* ${esc(`(${accounts.length} rekening)`)}\n\n`;
+      text += `🏦 *Rekening Bank*\n└ ${esc(formatRupiah(totalSaldo))} ${esc(`(${accounts.length} rekening)`)}\n\n`;
     }
 
     const totalWalletCount = wallets.length + ethWallets.length;
@@ -1034,12 +1034,12 @@ async function showMainMenu(ctx) {
       const solPart = syncedWallets.length ? formatSolEstimate(totalLamports, solPrices) : "Belum disinkronkan";
       const ethPart = syncedEthWallets.length ? formatEthEstimate(totalWei, solPrices) : "Belum disinkronkan";
       if (wallets.length && ethWallets.length) {
-        text += `├ 🟣 Solana: *${esc(solPart)}*\n`;
-        text += `└ 🔵 ETH Robinhood: *${esc(ethPart)}*\n\n`;
+        text += `├ 🟣 Solana: ${esc(solPart)}\n`;
+        text += `└ 🔵 ETH Robinhood: ${esc(ethPart)}\n\n`;
       } else if (wallets.length) {
-        text += `└ 🟣 Solana: *${esc(solPart)}*\n\n`;
+        text += `└ 🟣 Solana: ${esc(solPart)}\n\n`;
       } else if (ethWallets.length) {
-        text += `└ 🔵 ETH Robinhood: *${esc(ethPart)}*\n\n`;
+        text += `└ 🔵 ETH Robinhood: ${esc(ethPart)}\n\n`;
       }
     }
 
@@ -1096,7 +1096,7 @@ async function handleSaldo(ctx) {
       const branch = isLast ? "└" : "├";
       const subPipe = isLast ? "   " : "│  ";
       const icon = acc.bank_name.toLowerCase().includes("cash") || acc.bank_name.toLowerCase().includes("tunai") ? "💵" : "💳";
-      text += `${branch} ${icon} *${esc(acc.bank_name)}*\n${subPipe}└ *${esc(formatRupiah(acc.balance))}*\n`;
+      text += `${branch} ${icon} ${esc(acc.bank_name)}\n${subPipe}└ ${esc(formatRupiah(acc.balance))}\n`;
     });
     text += `\n`;
   }
@@ -1125,7 +1125,7 @@ async function handleSaldo(ctx) {
       const isLast = index === allCrypto.length - 1;
       const branch = isLast ? "└" : "├";
       const subPipe = isLast ? "   " : "│  ";
-      text += `${branch} ${w.icon} *${esc(w.label)}* ${esc(`(${w.chain})`)}\n${subPipe}└ *${esc(w.bal)}*\n`;
+      text += `${branch} ${w.icon} ${esc(w.label)} ${esc(`(${w.chain})`)}\n${subPipe}└ ${esc(w.bal)}\n`;
     });
     text += `\n`;
   }
