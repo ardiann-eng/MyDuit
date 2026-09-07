@@ -1094,8 +1094,9 @@ async function handleSaldo(ctx) {
     accounts.forEach((acc, index) => {
       const isLast = index === accounts.length - 1;
       const branch = isLast ? "└" : "├";
-      const icon = acc.balance >= 0 ? "🟢" : "🔴";
-      text += `${branch} ${icon} ${esc(acc.bank_name)} · *${esc(formatRupiah(acc.balance))}*\n`;
+      const subPipe = isLast ? "   " : "│  ";
+      const icon = acc.bank_name.toLowerCase().includes("cash") || acc.bank_name.toLowerCase().includes("tunai") ? "💵" : "💳";
+      text += `${branch} ${icon} *${esc(acc.bank_name)}*\n${subPipe}└ *${esc(formatRupiah(acc.balance))}*\n`;
     });
     text += `\n`;
   }
@@ -1108,12 +1109,14 @@ async function handleSaldo(ctx) {
     const allCrypto = [
       ...wallets.map(w => ({
         label: w.label,
-        isSol: true,
+        chain: "Solana",
+        icon: "🟣",
         bal: w.last_balance_lamports ? formatSolEstimate(BigInt(w.last_balance_lamports), solPrices) : "Belum disinkronkan",
       })),
       ...ethWallets.map(w => ({
         label: w.label,
-        isSol: false,
+        chain: "ETH Robinhood",
+        icon: "🔵",
         bal: w.last_balance_wei ? formatEthEstimate(w.last_balance_wei, solPrices) : "Belum disinkronkan",
       })),
     ];
@@ -1121,8 +1124,8 @@ async function handleSaldo(ctx) {
     allCrypto.forEach((w, index) => {
       const isLast = index === allCrypto.length - 1;
       const branch = isLast ? "└" : "├";
-      const icon = w.isSol ? "🟣" : "🔵";
-      text += `${branch} ${icon} ${esc(w.label)} · *${esc(w.bal)}*\n`;
+      const subPipe = isLast ? "   " : "│  ";
+      text += `${branch} ${w.icon} *${esc(w.label)}* ${esc(`(${w.chain})`)}\n${subPipe}└ *${esc(w.bal)}*\n`;
     });
     text += `\n`;
   }
