@@ -2561,11 +2561,11 @@ bot.on("message:text", async (ctx) => {
     editrek_input_saldo: 20,
     editrek_input_nama: 50,
     wallet_label: 50,
-    wallet_address: 60,
+    wallet_address: 2000,
     wallet_rename: 50,
     wallet_replace_address: 60,
     eth_wallet_label: 50,
-    eth_wallet_address: 60,
+    eth_wallet_address: 2000,
     eth_wallet_rename: 50,
     eth_wallet_replace_address: 60,
   };
