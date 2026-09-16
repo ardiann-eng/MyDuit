@@ -14,6 +14,7 @@ import {
   getActiveEthWallets,
   updateEthWalletBalance,
   setEthWalletError,
+  recordDailyAccountClosings,
 } from "../lib/db.js";
 import { formatRupiah, esc } from "../lib/format.js";
 import { getNativeSolBalances, formatSol } from "../lib/solana.js";
@@ -38,6 +39,8 @@ export default async function handler(req, res) {
     // Detect which cron is running based on UTC hour and day
     const isMonthlyReport = wibDay === 1 && wibHour >= 7 && wibHour <= 9;
     const isDailyReminder = wibHour >= 20 && wibHour <= 22;
+    const isDailyClosing = wibHour === 23;
+    const closingDate = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
     const users = await getAllUsers();
     
@@ -50,6 +53,7 @@ export default async function handler(req, res) {
         await Promise.all([
           isMonthlyReport ? sendMonthlyReport(user.telegram_id, user.name).then(() => results.sent++) : Promise.resolve(),
           isDailyReminder ? sendDailyReminder(user.telegram_id, user.name).then(sent => { if (sent) results.sent++; else results.skipped++; }) : Promise.resolve(),
+          isDailyClosing ? recordDailyAccountClosings(user.telegram_id, closingDate) : Promise.resolve(),
           sendLowBalanceAlert(user.telegram_id),
         ]);
         

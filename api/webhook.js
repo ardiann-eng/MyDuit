@@ -12,12 +12,14 @@ import {
   getTransactionsForCurrentMonth, getTransactionsForCurrentWeek, getTransactionsForMonth,
   getCategorySuggestions, upsertCategorySuggestion, updateSmartLimit,
   getAlertLogWithCooldown,
+  backfillAccountClosings, getMonthlyClosingReport,
   getSessionData, setSessionData, clearSessionData,
   updateAccountBalance, updateAccountName
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 import { isValidSolanaAddress, getNativeSolBalances, formatSol, shortenSolAddress } from "../lib/solana.js";
 import { isValidEthereumAddress, getNativeEthBalances, formatEth, shortenEthAddress } from "../lib/ethereum.js";
+import { createBalanceChart } from "../lib/chart.js";
 
 // ── SECURITY: VALIDATE REQUIRED ENV VARS ───────────────────────
 const requiredEnvVars = [
@@ -143,9 +145,9 @@ const pengaturanKeyboard = new InlineKeyboard()
 
 // ── HELPER ────────────────────────────────────────────────────
 function parseNominal(text) {
-  const clean = text.toLowerCase().trim().replace(/\./g, "").replace(/,/g, ".");
-  if (clean.endsWith("jt")) return parseFloat(clean) * 1_000_000;
-  if (clean.endsWith("rb") || clean.endsWith("k")) return parseFloat(clean) * 1_000;
+  const clean = text.toLowerCase().trim().replace(/\s+/g, "").replace(/\./g, "").replace(/,/g, ".");
+  if (clean.endsWith("jt") || clean.endsWith("juta")) return parseFloat(clean) * 1_000_000;
+  if (clean.endsWith("rb") || clean.endsWith("ribu") || clean.endsWith("k")) return parseFloat(clean) * 1_000;
   return parseFloat(clean);
 }
 
@@ -196,8 +198,69 @@ function createReportKeyboard() {
   return new InlineKeyboard()
     .text("📅 Minggu Ini", "laporan_minggu")
     .text("📊 Bulan Ini", "laporan_bulan").row()
+    .text("📈 Closing & Profit", "laporan_closing").row()
     .text("📥 Export CSV", "menu_export")
     .text("🏠 Menu Utama", "menu_start");
+}
+
+function getWibYearMonth(offsetMonths = 0) {
+  const wibNow = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  return new Date(Date.UTC(wibNow.getUTCFullYear(), wibNow.getUTCMonth() + offsetMonths, 1))
+    .toISOString().slice(0, 7);
+}
+
+function createClosingKeyboard() {
+  const keyboard = new InlineKeyboard();
+  for (const offset of [0, -1]) {
+    const yearMonth = getWibYearMonth(offset);
+    const label = new Intl.DateTimeFormat("id-ID", { month: "short", year: "numeric", timeZone: "UTC" })
+      .format(new Date(`${yearMonth}-01T00:00:00Z`));
+    keyboard.text(label, `closing_month_${yearMonth}`);
+  }
+  return keyboard.row().text("🏠 Menu Utama", "menu_start");
+}
+
+async function showClosingMenu(ctx) {
+  await clearSession(ctx.chat.id);
+  if (ctx.callbackQuery) await ctx.deleteMessage().catch(() => {});
+  return ctx.reply("📈 *Closing & Profit*\nPilih bulan:", {
+    parse_mode: "MarkdownV2",
+    reply_markup: createClosingKeyboard(),
+  });
+}
+
+async function sendClosingReport(ctx, yearMonth) {
+  if (!/^\d{4}-\d{2}$/.test(yearMonth)) return;
+  if (ctx.callbackQuery) await ctx.deleteMessage().catch(() => {});
+  const today = getWibDateKey();
+  const backfillStart = `${getWibYearMonth(-1)}-01`;
+  await backfillAccountClosings(ctx.from.id, backfillStart, today);
+  const report = await getMonthlyClosingReport(ctx.from.id, yearMonth);
+  if (!report?.points.length) {
+    return ctx.reply("📈 Belum ada data saldo untuk bulan ini\\.", {
+      parse_mode: "MarkdownV2",
+      reply_markup: createClosingKeyboard(),
+    });
+  }
+
+  const opening = report.points[0].balance;
+  const closing = report.points.at(-1).balance;
+  const change = closing - opening;
+  const growth = opening !== 0 ? change / Math.abs(opening) * 100 : 0;
+  const monthLabel = new Intl.DateTimeFormat("id-ID", { month: "long", year: "numeric", timeZone: "UTC" })
+    .format(new Date(`${yearMonth}-01T00:00:00Z`));
+  const signedMoney = (value) => `${value >= 0 ? "+" : "−"}${formatRupiah(Math.abs(value))}`;
+  const caption =
+    `📈 *${esc(monthLabel)}*\n` +
+    `Saldo: *${esc(formatRupiah(opening))} → ${esc(formatRupiah(closing))}* ${esc(`(${change >= 0 ? "+" : "−"}${Math.abs(growth).toFixed(1)}%)`)}\n` +
+    `Masuk ${esc(formatRupiah(report.income))}  •  Keluar ${esc(formatRupiah(report.expense))}\n` +
+    `Profit: *${esc(signedMoney(report.profit))}*  •  Δ Saldo: *${esc(signedMoney(change))}*`;
+  const chart = createBalanceChart(report.points);
+  return ctx.replyWithPhoto(new InputFile(chart, `closing-${yearMonth}.png`), {
+    caption,
+    parse_mode: "MarkdownV2",
+    reply_markup: createClosingKeyboard(),
+  });
 }
 
 function parseCallbackId(data, prefix) {
@@ -1430,6 +1493,8 @@ bot.command("catat", handleCatat);
 bot.hears("📝 Catat", handleCatat);
 
 bot.command("transfer", handleTransfer);
+bot.command("closing", showClosingMenu);
+bot.command("profit", showClosingMenu);
 
 bot.command("wallet", handleWallet);
 bot.command("ethwallet", handleEthWallet);
@@ -1639,6 +1704,10 @@ bot.on("callback_query:data", async (ctx) => {
     return handleRiwayat(ctx, page, true);
   }
 
+  if (data.startsWith("closing_month_")) {
+    return sendClosingReport(ctx, data.slice("closing_month_".length));
+  }
+
   if (data.startsWith("menu_")) {
     if (data !== "menu_lainnya" && data !== "menu_transfer") {
       try { await ctx.deleteMessage(); } catch (e) { }
@@ -1682,6 +1751,7 @@ bot.on("callback_query:data", async (ctx) => {
 
   if (data === "laporan_minggu") return generateReport(ctx, false);
   if (data === "laporan_bulan") return generateReport(ctx, true);
+  if (data === "laporan_closing") return showClosingMenu(ctx);
 
   if (data === "wallet_sync_all") {
     await ctx.answerCallbackQuery("⏳ Menyinkronkan semua wallet...");
@@ -2562,6 +2632,62 @@ function parseQuickTransaction(text, accounts) {
   };
 }
 
+function parseQuickTransfer(text, accounts) {
+  if (!accounts || accounts.length < 2) return null;
+  const rawText = text.trim();
+  if (rawText.startsWith("/") || !/\b(?:pindah(?:kan|in)?|transfer|tf)\b/i.test(rawText)) return null;
+
+  const lowerText = rawText.toLowerCase();
+  const mentionedAccounts = accounts
+    .map((account) => ({
+      account,
+      index: lowerText.indexOf(String(account.bank_name).toLowerCase()),
+    }))
+    .filter(({ index }) => index >= 0)
+    .sort((a, b) => a.index - b.index);
+
+  // A transfer must name two different accounts so an ordinary bank payment
+  // is not accidentally recorded as an internal transfer.
+  if (mentionedAccounts.length < 2) return null;
+
+  const markerBefore = (mention) => {
+    const markers = lowerText.slice(0, mention.index).match(/\b(?:dari|ke|menuju)\b/g);
+    return markers?.at(-1) || null;
+  };
+  const explicitFrom = mentionedAccounts.find((mention) => markerBefore(mention) === "dari");
+  const explicitTo = mentionedAccounts.find((mention) => /^(?:ke|menuju)$/.test(markerBefore(mention) || ""));
+  const fromMention = explicitFrom || mentionedAccounts[0];
+  const toMention = (explicitTo?.account.id !== fromMention.account.id ? explicitTo : null)
+    || mentionedAccounts.find(({ account }) => account.id !== fromMention.account.id);
+  if (!toMention) return null;
+
+  const hasDirection = Boolean(explicitFrom || explicitTo);
+  if (!hasDirection) return null;
+
+  const nominalRegex = /(?:rp\.?\s*)?(\b\d+(?:[.,]\d+)?\s*(?:jt|juta|rb|ribu|k)?\b)/i;
+  const nominalMatch = rawText.match(nominalRegex);
+  const amount = nominalMatch ? parseNominal(nominalMatch[1]) : null;
+  if (nominalMatch && !isValidNominal(amount)) return null;
+
+  let note = rawText;
+  if (nominalMatch) note = note.replace(nominalMatch[0], " ");
+  for (const { account } of [fromMention, toMention]) {
+    const escapedName = String(account.bank_name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    note = note.replace(new RegExp(escapedName, "gi"), " ");
+  }
+  note = note
+    .replace(/\b(?:pindah(?:kan|in)?|transfer|tf|dana|uang|saldo|dari|ke|menuju)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    fromAccount: fromMention.account,
+    toAccount: toMention.account,
+    amount,
+    note,
+  };
+}
+
 bot.on("message:text", async (ctx) => {
   // Security: Rate limiting
   if (isRateLimited(ctx.from.id)) return;
@@ -2572,6 +2698,43 @@ bot.on("message:text", async (ctx) => {
 
   if (!sess.step && !text.startsWith("/")) {
     const accounts = await getAccounts(ctx.from.id);
+    const quickTransfer = parseQuickTransfer(text, accounts);
+    if (quickTransfer) {
+      if (!quickTransfer.amount) {
+        await saveSession(chatId, {
+          step: "transfer_amount",
+          fromAccountId: quickTransfer.fromAccount.id,
+          fromAccountName: quickTransfer.fromAccount.bank_name,
+          toAccountId: quickTransfer.toAccount.id,
+          toAccountName: quickTransfer.toAccount.bank_name,
+          transferNote: quickTransfer.note,
+        });
+        return ctx.reply(
+          `↔️ Transfer *${esc(quickTransfer.fromAccount.bank_name)}* → *${esc(quickTransfer.toAccount.bank_name)}* terdeteksi\\.\n\n💵 Masukkan nominal transfer\\.\n_Contoh: 50000 / 50rb / 1jt_`,
+          { parse_mode: "MarkdownV2", reply_markup: new InlineKeyboard().text("❌ Batal", "batal") },
+        );
+      }
+
+      const transferId = createOperationId();
+      const saved = await createTransfer(
+        ctx.from.id,
+        quickTransfer.fromAccount.id,
+        quickTransfer.toAccount.id,
+        quickTransfer.amount,
+        quickTransfer.note,
+        transferId,
+      );
+      if (!saved) return ctx.reply("⚠️ Transfer gagal disimpan. Coba lagi.");
+      const [from, to] = await Promise.all([
+        getAccountById(quickTransfer.fromAccount.id, ctx.from.id),
+        getAccountById(quickTransfer.toAccount.id, ctx.from.id),
+      ]);
+      return ctx.reply(
+        `✅ *Transfer tercatat*\n\n${esc(from.bank_name)} → ${esc(to.bank_name)}\n*${esc(formatRupiah(quickTransfer.amount))}*${quickTransfer.note ? `\n📝 ${esc(quickTransfer.note)}` : ""}\n\nSaldo ${esc(from.bank_name)}: *${esc(formatRupiah(from.balance))}*\nSaldo ${esc(to.bank_name)}: *${esc(formatRupiah(to.balance))}*`,
+        { parse_mode: "MarkdownV2" },
+      );
+    }
+
     const quick = parseQuickTransaction(text, accounts);
     if (quick) {
       if (quick.error) return ctx.reply(`⚠️ ${quick.error}`, { parse_mode: "MarkdownV2" });
