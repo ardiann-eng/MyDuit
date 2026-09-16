@@ -1554,7 +1554,7 @@ async function generateReport(ctx, isMonthly, requestedMonth = null) {
     text = `📊 *Laporan ${esc(periodLabel)}*\n`;
     text += `📅 ${esc(compactDate(assetReport.startDate, false))}–${esc(compactDate(assetReport.endDate))}\n\n`;
     text += `💼 Aset  *${esc(formatRupiah(opening))} → ${esc(formatRupiah(latest.balance))}*\n`;
-    text += `   *${esc(signedAssetChange)}* ${esc(`(${assetChange >= 0 ? "+" : "−"}${Math.abs(assetGrowth).toFixed(1)}%)`)}\n`;
+    text += `*${esc(signedAssetChange)}* ${esc(`(${assetChange >= 0 ? "+" : "−"}${Math.abs(assetGrowth).toFixed(1)}%)`)}\n`;
     text += `🏦 ${esc(formatRupiah(latest.bankBalance))}  •  🌐 ${esc(formatRupiah(latest.web3Balance))}\n\n`;
     text += `💵 Masuk ${esc(formatRupiah(totalIn))}  •  Keluar ${esc(formatRupiah(totalOut))}\n`;
     text += `${diff >= 0 ? "📈" : "📉"} Arus kas *${esc(signedCashFlow)}*\n`;
