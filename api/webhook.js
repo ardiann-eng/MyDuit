@@ -203,6 +203,19 @@ function createReportKeyboard() {
     .text("🏠 Menu Utama", "menu_start");
 }
 
+function createMonthlyReportKeyboard() {
+  const keyboard = new InlineKeyboard();
+  for (const offset of [0, -1]) {
+    const yearMonth = getWibYearMonth(offset);
+    const label = new Intl.DateTimeFormat("id-ID", { month: "long", year: "numeric", timeZone: "UTC" })
+      .format(new Date(`${yearMonth}-01T00:00:00Z`));
+    keyboard.text(label, `laporan_month_${yearMonth}`);
+  }
+  return keyboard.row()
+    .text("📥 Export CSV", "menu_export")
+    .text("🏠 Menu Utama", "menu_start");
+}
+
 function getWibYearMonth(offsetMonths = 0) {
   const wibNow = new Date(Date.now() + 7 * 60 * 60 * 1000);
   return new Date(Date.UTC(wibNow.getUTCFullYear(), wibNow.getUTCMonth() + offsetMonths, 1))
@@ -1442,10 +1455,13 @@ async function handlePrediksi(ctx) {
   await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📝 Catat", "menu_catat"]) });
 }
 
-async function generateReport(ctx, isMonthly) {
+async function generateReport(ctx, isMonthly, requestedMonth = null) {
   await clearSession(ctx.chat.id);
   const telegramId = ctx.from.id;
-  const txs = isMonthly ? await getTransactionsForCurrentMonth(telegramId) : await getTransactionsForCurrentWeek(telegramId);
+  const yearMonth = isMonthly ? (requestedMonth || getWibYearMonth(0)) : null;
+  const txs = isMonthly
+    ? (requestedMonth ? await getTransactionsForMonth(telegramId, yearMonth) : await getTransactionsForCurrentMonth(telegramId))
+    : await getTransactionsForCurrentWeek(telegramId);
 
   if (txs.length === 0) return ctx.reply(`📊 Belum ada transaksi untuk periode ini\\.`, {
     parse_mode: "MarkdownV2",
@@ -1495,14 +1511,13 @@ async function generateReport(ctx, isMonthly) {
   else if (savingRate < 0) msgAdvice = "Pengeluaran membengkak dari pemasukan. Segera perbaiki keuanganmu!";
 
   const periodLabel = isMonthly
-    ? new Intl.DateTimeFormat("id-ID", { timeZone: "Asia/Jakarta", month: "long", year: "numeric" }).format(new Date())
+    ? new Intl.DateTimeFormat("id-ID", { timeZone: "UTC", month: "long", year: "numeric" }).format(new Date(`${yearMonth}-01T00:00:00Z`))
     : "minggu ini";
   let text = `📊 *Laporan ${esc(periodLabel)}*\n`;
 
   let assetReport = null;
   if (isMonthly) {
     const today = getWibDateKey();
-    const yearMonth = getWibYearMonth(0);
     await backfillAccountClosings(telegramId, `${getWibYearMonth(-1)}-01`, today);
     const bankReport = await getMonthlyClosingReport(telegramId, yearMonth);
     if (bankReport?.points.length) assetReport = await addWeb3ToClosingReport(telegramId, bankReport);
@@ -1519,7 +1534,14 @@ async function generateReport(ctx, isMonthly) {
     if (assetReport.includesWeb3) text += `_Web3 historis memakai estimasi_\n`;
     text += `\n`;
   }
-  text += `Transaksi tercatat: ${esc(formatDate(periodStart.toISOString().split('T')[0]))} \\- ${esc(formatDate(periodEnd.toISOString().split('T')[0]))}\n\n`;
+  if (isMonthly && assetReport) {
+    const formatReportDate = (date) => new Intl.DateTimeFormat("id-ID", {
+      day: "2-digit", month: "short", year: "numeric", timeZone: "UTC",
+    }).format(new Date(`${date}T00:00:00Z`));
+    text += `Periode laporan: ${esc(formatReportDate(assetReport.startDate))} \\- ${esc(formatReportDate(assetReport.endDate))}\n\n`;
+  } else {
+    text += `Transaksi tercatat: ${esc(formatDate(periodStart.toISOString().split('T')[0]))} \\- ${esc(formatDate(periodEnd.toISOString().split('T')[0]))}\n\n`;
+  }
   text += `💰 Pemasukan:    *${esc(formatRupiah(totalIn))}*\n`;
   text += `💸 Pengeluaran:  *${esc(formatRupiah(totalOut))}*\n`;
   text += `📈 Selisih:      *${esc(formatRupiah(diff))}*\n`;
@@ -1541,10 +1563,14 @@ async function generateReport(ctx, isMonthly) {
   text += `🎯 Skor kesehatan saat ini: *${esc(score.toString())}/100*\n`;
   text += `💡 _${esc(msgAdvice)}_`;
 
-  const replyOptions = { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📥 Export CSV", "menu_export"]) };
+  const replyOptions = {
+    parse_mode: "MarkdownV2",
+    reply_markup: isMonthly ? createMonthlyReportKeyboard() : createNavigationKeyboard(["📥 Export CSV", "menu_export"]),
+  };
   if (isMonthly && assetReport?.points.length) {
     const chart = createBalanceChart(assetReport.points);
-    return ctx.replyWithPhoto(new InputFile(chart, `laporan-${getWibYearMonth(0)}.png`), { ...replyOptions, caption: text });
+    if (ctx.callbackQuery) await ctx.deleteMessage().catch(() => {});
+    return ctx.replyWithPhoto(new InputFile(chart, `laporan-${yearMonth}.png`), { ...replyOptions, caption: text });
   }
   await ctx.reply(text, replyOptions);
 }
@@ -1764,6 +1790,14 @@ bot.on("callback_query:data", async (ctx) => {
     const page = Number(rawPage);
     if (!Number.isSafeInteger(page)) return;
     return handleRiwayat(ctx, page, true);
+  }
+
+  if (data.startsWith("laporan_month_")) {
+    const yearMonth = data.slice("laporan_month_".length);
+    if (!/^\d{4}-\d{2}$/.test(yearMonth)) return;
+    const allowedMonths = new Set([getWibYearMonth(0), getWibYearMonth(-1)]);
+    if (!allowedMonths.has(yearMonth)) return;
+    return generateReport(ctx, true, yearMonth);
   }
 
   if (data.startsWith("menu_")) {
