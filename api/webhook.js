@@ -1556,7 +1556,7 @@ async function generateReport(ctx, isMonthly, requestedMonth = null) {
       const pct = Math.round((amt / totalOut) * 100);
       text += `• ${esc(name)}    ${esc(formatRupiah(amt))} \\(${esc(pct.toString())}%\\)\n`;
     }
-    if (sortedCats.length > categoryLimit) text += `• \+${esc((sortedCats.length - categoryLimit).toString())} kategori lainnya\n`;
+    if (sortedCats.length > categoryLimit) text += `• ${esc(`+${sortedCats.length - categoryLimit} kategori lainnya`)}\n`;
     text += `\n`;
   }
 
