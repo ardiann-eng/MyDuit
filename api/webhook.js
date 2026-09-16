@@ -1534,6 +1534,41 @@ async function generateReport(ctx, isMonthly, requestedMonth = null) {
     if (assetReport.includesWeb3) text += `_Web3 historis memakai estimasi_\n`;
     text += `\n`;
   }
+  if (isMonthly && assetReport?.points.length) {
+    const opening = assetReport.points[0].balance;
+    const latest = assetReport.points.at(-1);
+    const assetChange = latest.balance - opening;
+    const assetGrowth = opening !== 0 ? assetChange / Math.abs(opening) * 100 : 0;
+    const signedAssetChange = `${assetChange >= 0 ? "+" : "−"}${formatRupiah(Math.abs(assetChange))}`;
+    const signedCashFlow = `${diff >= 0 ? "+" : "−"}${formatRupiah(Math.abs(diff))}`;
+    const compactDate = (date, includeMonth = true) => new Intl.DateTimeFormat("id-ID", {
+      day: "2-digit", ...(includeMonth ? { month: "long" } : {}), timeZone: "UTC",
+    }).format(new Date(`${date}T00:00:00Z`));
+    const topCategories = Array.from(cats.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name, amount]) => `${name} ${Math.round(amount / totalOut * 100)}%`)
+      .join(" • ");
+    const status = diff >= 0 ? "Arus kas positif" : "Pengeluaran melebihi pemasukan";
+
+    text = `📊 *Laporan ${esc(periodLabel)}*\n`;
+    text += `📅 ${esc(compactDate(assetReport.startDate, false))}–${esc(compactDate(assetReport.endDate))}\n\n`;
+    text += `💼 Aset  *${esc(formatRupiah(opening))} → ${esc(formatRupiah(latest.balance))}*\n`;
+    text += `   *${esc(signedAssetChange)}* ${esc(`(${assetChange >= 0 ? "+" : "−"}${Math.abs(assetGrowth).toFixed(1)}%)`)}\n`;
+    text += `🏦 ${esc(formatRupiah(latest.bankBalance))}  •  🌐 ${esc(formatRupiah(latest.web3Balance))}\n\n`;
+    text += `💵 Masuk ${esc(formatRupiah(totalIn))}  •  Keluar ${esc(formatRupiah(totalOut))}\n`;
+    text += `${diff >= 0 ? "📈" : "📉"} Arus kas *${esc(signedCashFlow)}*\n`;
+    if (topCategories) text += `📂 Terbesar: ${esc(topCategories)}\n`;
+    text += `🎯 Skor kini *${esc(score.toString())}/100*  •  ${esc(status)}`;
+
+    const chart = createBalanceChart(assetReport.points);
+    if (ctx.callbackQuery) await ctx.deleteMessage().catch(() => {});
+    return ctx.replyWithPhoto(new InputFile(chart, `laporan-${yearMonth}.png`), {
+      parse_mode: "MarkdownV2",
+      reply_markup: createMonthlyReportKeyboard(),
+      caption: text,
+    });
+  }
   if (isMonthly && assetReport) {
     const formatReportDate = (date) => new Intl.DateTimeFormat("id-ID", {
       day: "2-digit", month: "short", year: "numeric", timeZone: "UTC",
