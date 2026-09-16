@@ -14,6 +14,7 @@ import {
   getActiveEthWallets,
   updateEthWalletBalance,
   setEthWalletError,
+  insertEthSnapshot,
   recordDailyAccountClosings,
 } from "../lib/db.js";
 import { formatRupiah, esc } from "../lib/format.js";
@@ -74,6 +75,7 @@ export default async function handler(req, res) {
 
 async function syncDailyEthWallets() {
   const wallets = await getActiveEthWallets();
+  const date = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
   for (let offset = 0; offset < wallets.length; offset += 50) {
     const chunk = wallets.slice(offset, offset + 50);
     try {
@@ -81,6 +83,7 @@ async function syncDailyEthWallets() {
       for (const [index, wallet] of chunk.entries()) {
         const wei = balances[index];
         await updateEthWalletBalance(wallet.id, wei);
+        await insertEthSnapshot(wallet.id, date, wei);
       }
     } catch (error) {
       for (const wallet of chunk) await setEthWalletError(wallet.id, error.message);

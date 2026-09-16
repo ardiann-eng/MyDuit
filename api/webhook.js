@@ -12,7 +12,7 @@ import {
   getTransactionsForCurrentMonth, getTransactionsForCurrentWeek, getTransactionsForMonth,
   getCategorySuggestions, upsertCategorySuggestion, updateSmartLimit,
   getAlertLogWithCooldown,
-  backfillAccountClosings, getMonthlyClosingReport,
+  backfillAccountClosings, getMonthlyClosingReport, getWeb3HistoryInputs,
   getSessionData, setSessionData, clearSessionData,
   updateAccountBalance, updateAccountName
 } from "../lib/db.js";
@@ -57,6 +57,7 @@ const initPromise = initDB()
   .catch(err => console.error("DB init error:", err));
 
 let solPriceCache = { value: null, expiresAt: 0 };
+const cryptoHistoryCache = new Map();
 
 
 
@@ -198,7 +199,6 @@ function createReportKeyboard() {
   return new InlineKeyboard()
     .text("📅 Minggu Ini", "laporan_minggu")
     .text("📊 Bulan Ini", "laporan_bulan").row()
-    .text("📈 Closing & Profit", "laporan_closing").row()
     .text("📥 Export CSV", "menu_export")
     .text("🏠 Menu Utama", "menu_start");
 }
@@ -209,58 +209,95 @@ function getWibYearMonth(offsetMonths = 0) {
     .toISOString().slice(0, 7);
 }
 
-function createClosingKeyboard() {
-  const keyboard = new InlineKeyboard();
-  for (const offset of [0, -1]) {
-    const yearMonth = getWibYearMonth(offset);
-    const label = new Intl.DateTimeFormat("id-ID", { month: "short", year: "numeric", timeZone: "UTC" })
-      .format(new Date(`${yearMonth}-01T00:00:00Z`));
-    keyboard.text(label, `closing_month_${yearMonth}`);
-  }
-  return keyboard.row().text("🏠 Menu Utama", "menu_start");
+async function getHistoricalCryptoPrices(startDate, endDate) {
+  const cacheKey = `${startDate}:${endDate}`;
+  const cached = cryptoHistoryCache.get(cacheKey);
+  if (cached?.expiresAt > Date.now()) return cached.value;
+  const from = Math.floor(new Date(`${startDate}T00:00:00+07:00`).getTime() / 1000) - 86400;
+  const to = Math.floor(new Date(`${endDate}T23:59:59+07:00`).getTime() / 1000) + 86400;
+  const load = async (coin) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 7000);
+    try {
+      const response = await fetch(`https://api.coingecko.com/api/v3/coins/${coin}/market_chart/range?vs_currency=idr&from=${from}&to=${to}`, { signal: controller.signal });
+      if (!response.ok) throw new Error(`CoinGecko ${coin}: HTTP ${response.status}`);
+      const body = await response.json();
+      const daily = new Map();
+      for (const [timestamp, price] of body.prices || []) {
+        const date = new Date(timestamp + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        daily.set(date, Number(price));
+      }
+      return daily;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  const [sol, eth] = await Promise.all([load("solana"), load("ethereum")]);
+  const value = { sol, eth };
+  cryptoHistoryCache.set(cacheKey, { value, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
+  return value;
 }
 
-async function showClosingMenu(ctx) {
-  await clearSession(ctx.chat.id);
-  if (ctx.callbackQuery) await ctx.deleteMessage().catch(() => {});
-  return ctx.reply("📈 *Closing & Profit*\nPilih bulan:", {
-    parse_mode: "MarkdownV2",
-    reply_markup: createClosingKeyboard(),
-  });
-}
-
-async function sendClosingReport(ctx, yearMonth) {
-  if (!/^\d{4}-\d{2}$/.test(yearMonth)) return;
-  if (ctx.callbackQuery) await ctx.deleteMessage().catch(() => {});
-  const today = getWibDateKey();
-  const backfillStart = `${getWibYearMonth(-1)}-01`;
-  await backfillAccountClosings(ctx.from.id, backfillStart, today);
-  const report = await getMonthlyClosingReport(ctx.from.id, yearMonth);
-  if (!report?.points.length) {
-    return ctx.reply("📈 Belum ada data saldo untuk bulan ini\\.", {
-      parse_mode: "MarkdownV2",
-      reply_markup: createClosingKeyboard(),
-    });
+async function addWeb3ToClosingReport(telegramId, report) {
+  const inputs = await getWeb3HistoryInputs(telegramId, report.endDate);
+  if (!inputs.solWallets.length && !inputs.ethWallets.length) {
+    return {
+      ...report,
+      includesWeb3: false,
+      points: report.points.map((point) => ({ ...point, bankBalance: point.balance, web3Balance: 0 })),
+    };
   }
 
-  const opening = report.points[0].balance;
-  const closing = report.points.at(-1).balance;
-  const change = closing - opening;
-  const growth = opening !== 0 ? change / Math.abs(opening) * 100 : 0;
-  const monthLabel = new Intl.DateTimeFormat("id-ID", { month: "long", year: "numeric", timeZone: "UTC" })
-    .format(new Date(`${yearMonth}-01T00:00:00Z`));
-  const signedMoney = (value) => `${value >= 0 ? "+" : "−"}${formatRupiah(Math.abs(value))}`;
-  const caption =
-    `📈 *${esc(monthLabel)}*\n` +
-    `Saldo: *${esc(formatRupiah(opening))} → ${esc(formatRupiah(closing))}* ${esc(`(${change >= 0 ? "+" : "−"}${Math.abs(growth).toFixed(1)}%)`)}\n` +
-    `Masuk ${esc(formatRupiah(report.income))}  •  Keluar ${esc(formatRupiah(report.expense))}\n` +
-    `Profit: *${esc(signedMoney(report.profit))}*  •  Δ Saldo: *${esc(signedMoney(change))}*`;
-  const chart = createBalanceChart(report.points);
-  return ctx.replyWithPhoto(new InputFile(chart, `closing-${yearMonth}.png`), {
-    caption,
-    parse_mode: "MarkdownV2",
-    reply_markup: createClosingKeyboard(),
+  let priceHistory;
+  try {
+    priceHistory = await getHistoricalCryptoPrices(report.startDate, report.endDate);
+  } catch (error) {
+    console.warn("Historical crypto prices unavailable:", error.message);
+    const current = await getSolPrices();
+    priceHistory = {
+      sol: new Map(report.points.map((point) => [point.date, current?.idr || 0])),
+      eth: new Map(report.points.map((point) => [point.date, current?.ethIdr || 0])),
+    };
+  }
+
+  const snapshotsByWallet = new Map();
+  for (const snapshot of inputs.solSnapshots) {
+    if (!snapshotsByWallet.has(Number(snapshot.wallet_id))) snapshotsByWallet.set(Number(snapshot.wallet_id), []);
+    snapshotsByWallet.get(Number(snapshot.wallet_id)).push(snapshot);
+  }
+  const solBalances = new Map(inputs.solWallets.map((wallet) => {
+    const history = snapshotsByWallet.get(Number(wallet.id)) || [];
+    return [Number(wallet.id), BigInt(history[0]?.lamports ?? wallet.last_balance_lamports ?? 0)];
+  }));
+  const ethSnapshotsByWallet = new Map();
+  for (const snapshot of inputs.ethSnapshots) {
+    if (!ethSnapshotsByWallet.has(Number(snapshot.wallet_id))) ethSnapshotsByWallet.set(Number(snapshot.wallet_id), []);
+    ethSnapshotsByWallet.get(Number(snapshot.wallet_id)).push(snapshot);
+  }
+  const ethBalances = new Map(inputs.ethWallets.map((wallet) => {
+    const history = ethSnapshotsByWallet.get(Number(wallet.id)) || [];
+    return [Number(wallet.id), BigInt(history[0]?.wei ?? wallet.last_balance_wei ?? 0)];
+  }));
+  let lastSolPrice = 0;
+  let lastEthPrice = 0;
+  const points = report.points.map((point) => {
+    for (const wallet of inputs.solWallets) {
+      const snapshot = (snapshotsByWallet.get(Number(wallet.id)) || []).find((item) => item.snapshot_date === point.date);
+      if (snapshot) solBalances.set(Number(wallet.id), BigInt(snapshot.lamports));
+    }
+    for (const wallet of inputs.ethWallets) {
+      const snapshot = (ethSnapshotsByWallet.get(Number(wallet.id)) || []).find((item) => item.snapshot_date === point.date);
+      if (snapshot) ethBalances.set(Number(wallet.id), BigInt(snapshot.wei));
+    }
+    lastSolPrice = priceHistory.sol.get(point.date) || lastSolPrice;
+    lastEthPrice = priceHistory.eth.get(point.date) || lastEthPrice;
+    const lamports = Array.from(solBalances.values()).reduce((sum, value) => sum + value, 0n);
+    const ethWei = Array.from(ethBalances.values()).reduce((sum, value) => sum + value, 0n);
+    const web3Value = Number(lamports) / 1_000_000_000 * lastSolPrice
+      + Number(ethWei) / 1_000_000_000_000_000_000 * lastEthPrice;
+    return { ...point, bankBalance: point.balance, web3Balance: web3Value, balance: point.balance + web3Value };
   });
+  return { ...report, points, includesWeb3: true, web3Estimated: true };
 }
 
 function parseCallbackId(data, prefix) {
@@ -1461,6 +1498,27 @@ async function generateReport(ctx, isMonthly) {
     ? new Intl.DateTimeFormat("id-ID", { timeZone: "Asia/Jakarta", month: "long", year: "numeric" }).format(new Date())
     : "minggu ini";
   let text = `📊 *Laporan ${esc(periodLabel)}*\n`;
+
+  let assetReport = null;
+  if (isMonthly) {
+    const today = getWibDateKey();
+    const yearMonth = getWibYearMonth(0);
+    await backfillAccountClosings(telegramId, `${getWibYearMonth(-1)}-01`, today);
+    const bankReport = await getMonthlyClosingReport(telegramId, yearMonth);
+    if (bankReport?.points.length) assetReport = await addWeb3ToClosingReport(telegramId, bankReport);
+  }
+  if (assetReport?.points.length) {
+    const opening = assetReport.points[0].balance;
+    const latest = assetReport.points.at(-1);
+    const assetChange = latest.balance - opening;
+    const assetGrowth = opening !== 0 ? assetChange / Math.abs(opening) * 100 : 0;
+    const signedAssetChange = `${assetChange >= 0 ? "+" : "−"}${formatRupiah(Math.abs(assetChange))}`;
+    text += `💼 Total aset: *${esc(formatRupiah(opening))} → ${esc(formatRupiah(latest.balance))}* ${esc(`(${assetChange >= 0 ? "+" : "−"}${Math.abs(assetGrowth).toFixed(1)}%)`)}\n`;
+    text += `🏦 Rekening ${esc(formatRupiah(latest.bankBalance))}  •  🌐 Web3 ${esc(formatRupiah(latest.web3Balance))}\n`;
+    text += `📈 Penambahan aset: *${esc(signedAssetChange)}*\n`;
+    if (assetReport.includesWeb3) text += `_Web3 historis memakai estimasi_\n`;
+    text += `\n`;
+  }
   text += `Transaksi tercatat: ${esc(formatDate(periodStart.toISOString().split('T')[0]))} \\- ${esc(formatDate(periodEnd.toISOString().split('T')[0]))}\n\n`;
   text += `💰 Pemasukan:    *${esc(formatRupiah(totalIn))}*\n`;
   text += `💸 Pengeluaran:  *${esc(formatRupiah(totalOut))}*\n`;
@@ -1471,18 +1529,24 @@ async function generateReport(ctx, isMonthly) {
   if (cats.size > 0) {
     text += `📂 *Pengeluaran terbesar*\n`;
     const sortedCats = Array.from(cats.entries()).sort((a, b) => b[1] - a[1]);
-    for (const [name, amt] of sortedCats.slice(0, 5)) {
+    const categoryLimit = isMonthly ? 3 : 5;
+    for (const [name, amt] of sortedCats.slice(0, categoryLimit)) {
       const pct = Math.round((amt / totalOut) * 100);
       text += `• ${esc(name)}    ${esc(formatRupiah(amt))} \\(${esc(pct.toString())}%\\)\n`;
     }
-    if (sortedCats.length > 5) text += `• \+${esc((sortedCats.length - 5).toString())} kategori lainnya\n`;
+    if (sortedCats.length > categoryLimit) text += `• \+${esc((sortedCats.length - categoryLimit).toString())} kategori lainnya\n`;
     text += `\n`;
   }
 
   text += `🎯 Skor kesehatan saat ini: *${esc(score.toString())}/100*\n`;
   text += `💡 _${esc(msgAdvice)}_`;
 
-  await ctx.reply(text, { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📥 Export CSV", "menu_export"]) });
+  const replyOptions = { parse_mode: "MarkdownV2", reply_markup: createNavigationKeyboard(["📥 Export CSV", "menu_export"]) };
+  if (isMonthly && assetReport?.points.length) {
+    const chart = createBalanceChart(assetReport.points);
+    return ctx.replyWithPhoto(new InputFile(chart, `laporan-${getWibYearMonth(0)}.png`), { ...replyOptions, caption: text });
+  }
+  await ctx.reply(text, replyOptions);
 }
 
 // ── COMMAND BINDINGS ──────────────────────────────────────────
@@ -1493,8 +1557,6 @@ bot.command("catat", handleCatat);
 bot.hears("📝 Catat", handleCatat);
 
 bot.command("transfer", handleTransfer);
-bot.command("closing", showClosingMenu);
-bot.command("profit", showClosingMenu);
 
 bot.command("wallet", handleWallet);
 bot.command("ethwallet", handleEthWallet);
@@ -1704,10 +1766,6 @@ bot.on("callback_query:data", async (ctx) => {
     return handleRiwayat(ctx, page, true);
   }
 
-  if (data.startsWith("closing_month_")) {
-    return sendClosingReport(ctx, data.slice("closing_month_".length));
-  }
-
   if (data.startsWith("menu_")) {
     if (data !== "menu_lainnya" && data !== "menu_transfer") {
       try { await ctx.deleteMessage(); } catch (e) { }
@@ -1751,7 +1809,6 @@ bot.on("callback_query:data", async (ctx) => {
 
   if (data === "laporan_minggu") return generateReport(ctx, false);
   if (data === "laporan_bulan") return generateReport(ctx, true);
-  if (data === "laporan_closing") return showClosingMenu(ctx);
 
   if (data === "wallet_sync_all") {
     await ctx.answerCallbackQuery("⏳ Menyinkronkan semua wallet...");
