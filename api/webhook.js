@@ -419,7 +419,7 @@ async function getBitgetForContext(ctx, forceRefresh = false) {
 function formatBitgetBalance(bitget) {
   if (!bitget.configured) return "API belum dikonfigurasi";
   if (bitget.equity_usd === null || bitget.equity_usd === undefined) {
-    return bitget.last_error ? "Sinkronisasi gagal; periksa API key dan izin" : "Belum disinkronkan";
+    return bitget.last_error ? `Sinkronisasi gagal (${bitget.last_error})` : "Belum disinkronkan";
   }
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(bitget.equity_usd);
   const idr = bitget.equity_idr === null || bitget.equity_idr === undefined
