@@ -19,6 +19,7 @@ import {
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 import { isValidSolanaAddress, getNativeSolBalances, formatSol, shortenSolAddress } from "../lib/solana.js";
 import { isValidEthereumAddress, getNativeEthBalances, formatEth, shortenEthAddress } from "../lib/ethereum.js";
+import { getCryptoPrices } from "../lib/crypto-prices.js";
 import { createBalanceChart } from "../lib/chart.js";
 
 // ── SECURITY: VALIDATE REQUIRED ENV VARS ───────────────────────
@@ -56,7 +57,6 @@ const initPromise = initDB()
   .then(() => { dbInitialized = true; })
   .catch(err => console.error("DB init error:", err));
 
-let solPriceCache = { value: null, expiresAt: 0 };
 const cryptoHistoryCache = new Map();
 
 
@@ -380,38 +380,11 @@ function createWalletActions(wallet) {
 
 async function formatWalletDetail(wallet) {
   const lamports = wallet.last_balance_lamports;
-  const balance = lamports ? formatSolEstimate(BigInt(lamports), await getSolPrices()) : "Belum disinkronkan";
+  const balance = lamports !== null && lamports !== undefined ? formatSolEstimate(BigInt(lamports), await getCryptoPrices()) : "Belum disinkronkan";
   return `🪙 *${esc(wallet.label)}*\n\n` +
     `🟣 *Your Solana Wallet Address*\n` +
     `├ \`${wallet.address}\`\n` +
     `└ *${esc(balance)}*`;
-}
-
-async function getSolPrices() {
-  if (solPriceCache.expiresAt > Date.now()) return solPriceCache.value;
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-     const response = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana,ethereum&vs_currencies=usd,idr", { signal: controller.signal });
-    clearTimeout(timeout);
-    if (!response.ok) throw new Error(`SOL price HTTP ${response.status}`);
-     const body = await response.json();
-     const solana = body?.solana;
-     const ethereum = body?.ethereum;
-     const prices = {
-       usd: Number(solana?.usd),
-       idr: Number(solana?.idr),
-       ethUsd: Number(ethereum?.usd),
-       ethIdr: Number(ethereum?.idr),
-     };
-     if (!Number.isFinite(prices.usd) || prices.usd <= 0 || !Number.isFinite(prices.idr) || prices.idr <= 0) throw new Error("Crypto price response invalid");
-    solPriceCache = { value: prices, expiresAt: Date.now() + 5 * 60 * 1000 };
-    return prices;
-  } catch (error) {
-    console.warn("SOL price unavailable:", error.message);
-    solPriceCache = { value: null, expiresAt: Date.now() + 60 * 1000 };
-    return null;
-  }
 }
 
 function formatSolEstimate(lamports, solPrices) {
@@ -1129,7 +1102,7 @@ async function showMainMenu(ctx) {
       tip = "Kondisi kritis\\! Tunda pengeluaran non\\-esensial dulu ya\\.";
     }
 
-    const solPrices = syncedWallets.length || syncedEthWallets.length ? await getSolPrices() : null;
+    const solPrices = syncedWallets.length || syncedEthWallets.length ? await getCryptoPrices() : null;
     const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
     const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
     const totalAset = totalSaldo + solValueIdr + ethValueIdr;
@@ -1192,7 +1165,7 @@ async function handleSaldo(ctx) {
   const syncedEthWallets = ethWallets.filter((wallet) => wallet.last_balance_wei !== null && wallet.last_balance_wei !== undefined);
   const totalLamports = syncedWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_lamports), 0n);
   const totalWei = syncedEthWallets.reduce((sum, wallet) => sum + BigInt(wallet.last_balance_wei), 0n);
-  const solPrices = syncedWallets.length || syncedEthWallets.length ? await getSolPrices() : null;
+  const solPrices = syncedWallets.length || syncedEthWallets.length ? await getCryptoPrices() : null;
 
   const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
   const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
@@ -1214,19 +1187,21 @@ async function handleSaldo(ctx) {
 
   const totalWalletCount = wallets.length + ethWallets.length;
   if (totalWalletCount > 0) {
-    const totalWeb3Label = (solPrices?.idr || solPrices?.ethIdr) ? formatRupiah(totalWeb3) : "Belum disinkronkan";
+    const hasSyncedWallet = syncedWallets.length || syncedEthWallets.length;
+    const allSyncedWalletsPriced = (!syncedWallets.length || solPrices?.idr) && (!syncedEthWallets.length || solPrices?.ethIdr);
+    const totalWeb3Label = !hasSyncedWallet ? "Belum disinkronkan" : allSyncedWalletsPriced ? formatRupiah(totalWeb3) : "estimasi IDR belum tersedia";
     text += `🌐 *Web3 Wallet* ${esc(`(${totalWeb3Label})`)}\n`;
 
     const allCrypto = [
       ...wallets.map(w => ({
         label: w.label,
         icon: "🟣",
-        bal: w.last_balance_lamports ? formatSolEstimate(BigInt(w.last_balance_lamports), solPrices) : "Belum disinkronkan",
+        bal: w.last_balance_lamports !== null && w.last_balance_lamports !== undefined ? formatSolEstimate(BigInt(w.last_balance_lamports), solPrices) : "Belum disinkronkan",
       })),
       ...ethWallets.map(w => ({
         label: w.label,
         icon: "🔵",
-        bal: w.last_balance_wei ? formatEthEstimate(w.last_balance_wei, solPrices) : "Belum disinkronkan",
+        bal: w.last_balance_wei !== null && w.last_balance_wei !== undefined ? formatEthEstimate(w.last_balance_wei, solPrices) : "Belum disinkronkan",
       })),
     ];
 
