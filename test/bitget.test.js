@@ -10,9 +10,9 @@ test("Bitget Unified request is signed and account equity is parsed", async () =
     secret: process.env.BITGET_API_SECRET,
     passphrase: process.env.BITGET_API_PASSPHRASE,
   };
-  process.env.BITGET_API_KEY = "test-key";
-  process.env.BITGET_API_SECRET = "test-secret";
-  process.env.BITGET_API_PASSPHRASE = "test-passphrase";
+  process.env.BITGET_API_KEY = " test-key ";
+  process.env.BITGET_API_SECRET = " test-secret ";
+  process.env.BITGET_API_PASSPHRASE = " test-passphrase ";
   globalThis.fetch = async (url, options) => {
     assert.equal(url, "https://api.bitget.com/api/v3/account/assets");
     assert.equal(options.headers["ACCESS-KEY"], "test-key");
