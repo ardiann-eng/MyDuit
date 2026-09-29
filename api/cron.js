@@ -20,6 +20,8 @@ import {
 import { formatRupiah, esc } from "../lib/format.js";
 import { getNativeSolBalances, formatSol } from "../lib/solana.js";
 import { getNativeEthBalances } from "../lib/ethereum.js";
+import { hasBitgetCredentials } from "../lib/bitget.js";
+import { syncBitgetBalance } from "../lib/bitget-balance.js";
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN);
 
@@ -46,7 +48,11 @@ export default async function handler(req, res) {
     const users = await getAllUsers();
     
     const results = { sent: 0, skipped: 0, errors: 0 };
-    if (isDailyReminder) await Promise.all([syncDailySolWallets(), syncDailyEthWallets()]);
+    if (isDailyReminder) await Promise.all([
+      syncDailySolWallets(), syncDailyEthWallets(),
+      process.env.BITGET_TELEGRAM_ID && hasBitgetCredentials()
+        ? syncBitgetBalance(process.env.BITGET_TELEGRAM_ID) : Promise.resolve(),
+    ]);
 
     for (const user of users) {
       try {

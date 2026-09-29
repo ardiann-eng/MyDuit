@@ -54,7 +54,17 @@ Dibangun dengan **Vercel** (serverless) + **Turso** (SQLite cloud) — 100% grat
    WEBHOOK_SECRET      = (string rahasia panjang untuk validasi webhook)
    CRON_SECRET         = (string rahasia untuk validasi cron jobs)
    ALLOWED_USER_ID     = (opsional: comma-separated user IDs untuk private mode)
+   BITGET_TELEGRAM_ID  = (opsional: ID Telegram pemilik saldo Bitget)
+   BITGET_API_KEY      = (opsional: API key Bitget Unified)
+   BITGET_API_SECRET   = (opsional: secret key Bitget Unified)
+   BITGET_API_PASSPHRASE = (opsional: passphrase API Bitget)
    ```
+   Untuk integrasi Bitget, buat API key dengan izin **Unified Account Management: Read-Only**.
+   Simpan ketiga kredensial hanya di Environment Variables Vercel, dan isi `BITGET_TELEGRAM_ID`
+   agar saldo hanya muncul di chat pribadi pemilik. Nilai Bitget Unified muncul di bagian
+   **Bank & Bitget** pada `/saldo` dan menu utama, serta disinkronkan oleh cron harian.
+   Akun Funding tidak termasuk. Bitget menyarankan IP whitelist; gunakan egress ber-IP tetap
+   bila Anda mengaktifkannya pada deployment Vercel.
 5. Klik **Deploy**
 6. Setelah deploy, salin URL project → contoh: `https://myduit-bot.vercel.app`
 

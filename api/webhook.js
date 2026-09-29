@@ -14,12 +14,14 @@ import {
   getAlertLogWithCooldown,
   backfillAccountClosings, getMonthlyClosingReport, getWeb3HistoryInputs,
   getSessionData, setSessionData, clearSessionData,
-  updateAccountBalance, updateAccountName
+  updateAccountBalance, updateAccountName, getBitgetBalance
 } from "../lib/db.js";
 import { formatRupiah, formatDate, esc } from "../lib/format.js";
 import { isValidSolanaAddress, getNativeSolBalances, formatSol, shortenSolAddress } from "../lib/solana.js";
 import { isValidEthereumAddress, getNativeEthBalances, formatEth, shortenEthAddress } from "../lib/ethereum.js";
 import { getCryptoPrices } from "../lib/crypto-prices.js";
+import { hasBitgetCredentials, isBitgetOwner } from "../lib/bitget.js";
+import { syncBitgetBalance } from "../lib/bitget-balance.js";
 import { createBalanceChart } from "../lib/chart.js";
 
 // ── SECURITY: VALIDATE REQUIRED ENV VARS ───────────────────────
@@ -399,6 +401,31 @@ function formatEthEstimate(wei, solPrices) {
   if (!solPrices?.ethUsd || !Number.isFinite(eth)) return `${formatEth(wei)} (estimasi USD belum tersedia)`;
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(eth * solPrices.ethUsd);
   return `${formatEth(wei)} (${usd})`;
+}
+
+async function getBitgetForContext(ctx, forceRefresh = false) {
+  if (!isBitgetOwner(ctx.from.id, ctx.chat?.type)) return null;
+  if (!hasBitgetCredentials()) return { configured: false };
+  if (!forceRefresh) {
+    const cached = await getBitgetBalance(ctx.from.id);
+    const checkedAt = cached?.last_checked_at && Date.parse(`${cached.last_checked_at.replace(" ", "T")}Z`);
+    if (checkedAt && !cached.last_error && Date.now() - checkedAt < 5 * 60 * 1000) {
+      return { configured: true, ...cached };
+    }
+  }
+  return { configured: true, ...(await syncBitgetBalance(ctx.from.id)) };
+}
+
+function formatBitgetBalance(bitget) {
+  if (!bitget.configured) return "API belum dikonfigurasi";
+  if (bitget.equity_usd === null || bitget.equity_usd === undefined) {
+    return bitget.last_error ? "Sinkronisasi gagal; periksa API key dan izin" : "Belum disinkronkan";
+  }
+  const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(bitget.equity_usd);
+  const idr = bitget.equity_idr === null || bitget.equity_idr === undefined
+    ? "estimasi IDR belum tersedia" : formatRupiah(bitget.equity_idr);
+  const stale = bitget.last_error ? `; data terakhir ${bitget.last_checked_at || "tidak diketahui"} UTC` : "";
+  return `${idr} (${usd}${stale})`;
 }
 
 async function syncAllUserWallets(telegramId) {
@@ -1057,6 +1084,7 @@ async function showMainMenu(ctx) {
       thisMonthTxs,
        wallets,
        ethWallets,
+       bitget,
     ] = await Promise.all([
       getAccounts(ctx.from.id),
       getUserSettings(ctx.from.id),
@@ -1066,6 +1094,7 @@ async function showMainMenu(ctx) {
       getTransactionsForCurrentMonth(ctx.from.id),
        getSolWallets(ctx.from.id),
        getEthWallets(ctx.from.id),
+       getBitgetForContext(ctx),
     ]);
     console.log(`⏱ /start step2 parallel fetch: ${Date.now() - t1}ms`);
 
@@ -1105,13 +1134,21 @@ async function showMainMenu(ctx) {
     const solPrices = syncedWallets.length || syncedEthWallets.length ? await getCryptoPrices() : null;
     const solValueIdr = solPrices?.idr ? Number(totalLamports) / 1_000_000_000 * solPrices.idr : 0;
     const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
-    const totalAset = totalSaldo + solValueIdr + ethValueIdr;
+    const bitgetIdr = Number(bitget?.equity_idr) || 0;
+    const totalAset = totalSaldo + solValueIdr + ethValueIdr + bitgetIdr;
+    const bitgetUnpriced = bitget && bitget.equity_idr === null && bitget.equity_usd !== null;
+    const bitgetStale = Boolean(bitget?.last_error && bitget?.equity_idr !== null && bitget?.equity_idr !== undefined);
 
     let text = `👋 Halo, *${esc(name)}\\!*\nRingkasan kondisi keuangan & aset kamu hari ini:\n\n`;
     text += `💼 *Total Aset*\n└ *${esc(formatRupiah(totalAset))}*\n\n`;
+    if (bitgetUnpriced) text += `_Nilai Bitget belum masuk total karena kurs IDR belum tersedia_\n\n`;
+    if (bitgetStale) text += `_Total memakai saldo Bitget terakhir yang tersimpan_\n\n`;
 
-    if (accounts.length > 0) {
-      text += `🏦 *Rekening Bank*\n└ ${esc(formatRupiah(totalSaldo))} ${esc(`(${accounts.length} rekening)`)}\n\n`;
+    if (accounts.length > 0 || bitget) {
+      text += `🏦 *Bank & Bitget*\n`;
+      if (accounts.length) text += `├ Rekening: ${esc(formatRupiah(totalSaldo))} ${esc(`(${accounts.length})`)}\n`;
+      if (bitget) text += `└ Bitget Unified: ${esc(formatBitgetBalance(bitget))}\n`;
+      text += `\n`;
     }
 
     const totalWalletCount = wallets.length + ethWallets.length;
@@ -1158,8 +1195,10 @@ bot.command("start", async (ctx) => {
 
 async function handleSaldo(ctx) {
   await clearSession(ctx.chat.id);
-  const [accounts, wallets, ethWallets] = await Promise.all([getAccounts(ctx.from.id), getSolWallets(ctx.from.id), getEthWallets(ctx.from.id)]);
-  if (!accounts.length && !wallets.length && !ethWallets.length) return ctx.reply(`💳 Belum ada rekening atau wallet tercatat\\.\n\nGunakan /tambahbank atau buka menu Wallet untuk menambahkan aset pertama\\.`, { parse_mode: "MarkdownV2" });
+  const [accounts, wallets, ethWallets, bitget] = await Promise.all([
+    getAccounts(ctx.from.id), getSolWallets(ctx.from.id), getEthWallets(ctx.from.id), getBitgetForContext(ctx, true),
+  ]);
+  if (!accounts.length && !wallets.length && !ethWallets.length && !bitget) return ctx.reply(`💳 Belum ada rekening atau wallet tercatat\\.\n\nGunakan /tambahbank atau buka menu Wallet untuk menambahkan aset pertama\\.`, { parse_mode: "MarkdownV2" });
 
   const syncedWallets = wallets.filter((wallet) => wallet.last_balance_lamports !== null && wallet.last_balance_lamports !== undefined);
   const syncedEthWallets = ethWallets.filter((wallet) => wallet.last_balance_wei !== null && wallet.last_balance_wei !== undefined);
@@ -1171,17 +1210,21 @@ async function handleSaldo(ctx) {
   const ethValueIdr = solPrices?.ethIdr ? Number(totalWei) / 1_000_000_000_000_000_000 * solPrices.ethIdr : 0;
   const totalBank = accounts.reduce((sum, acc) => sum + acc.balance, 0);
   const totalWeb3 = solValueIdr + ethValueIdr;
-  const totalAssets = totalBank + totalWeb3;
+  const bitgetIdr = Number(bitget?.equity_idr) || 0;
+  const totalAssets = totalBank + bitgetIdr + totalWeb3;
+  const bitgetUnpriced = bitget && bitget.equity_idr === null && bitget.equity_usd !== null;
+  const bitgetStale = Boolean(bitget?.last_error && bitget?.equity_idr !== null && bitget?.equity_idr !== undefined);
 
   let text = `💼 *Rincian Saldo & Aset*\n\n`;
 
-  if (accounts.length > 0) {
-    text += `🏦 *Rekening Bank* ${esc(`(${formatRupiah(totalBank)})`)}\n`;
+  if (accounts.length > 0 || bitget) {
+    text += `🏦 *Bank & Bitget* ${esc(`(${formatRupiah(totalBank + bitgetIdr)})`)}\n`;
     accounts.forEach((acc, index) => {
-      const isLast = index === accounts.length - 1;
+      const isLast = index === accounts.length - 1 && !bitget;
       const branch = isLast ? "└" : "├";
       text += `${branch} ${esc(acc.bank_name)}: ${esc(formatRupiah(acc.balance))}\n`;
     });
+    if (bitget) text += `└ Bitget Unified: ${esc(formatBitgetBalance(bitget))}\n`;
     text += `\n`;
   }
 
@@ -1214,6 +1257,8 @@ async function handleSaldo(ctx) {
   }
 
   text += `📊 *Total Aset Keseluruhan*\n└ *${esc(formatRupiah(totalAssets))}*`;
+  if (bitgetUnpriced) text += `\n_Nilai Bitget belum masuk total karena kurs IDR belum tersedia_`;
+  if (bitgetStale) text += `\n_Total memakai saldo Bitget terakhir yang tersimpan_`;
 
   await ctx.reply(text, {
     parse_mode: "MarkdownV2",
